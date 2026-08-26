@@ -37,6 +37,14 @@ from .multi_modal_postprocess import compute_multi_modal_inputs, compute_positio
 
 logger = logging.getLogger(__name__)
 
+_PROMPT_TERMINAL_SCHEMA_VERSION = 1
+_FRAMEWORK_METRIC_KEYS = (
+    "generation/unhandled_failure_count",
+    "sink/trajectory_write_failure_count",
+    "sink/prompt_terminal_write_failure_count",
+    "sink/trajectory_dump_failure_count",
+)
+
 
 class AgentRunner(Protocol):
     """Callable contract for an agent episode over a Gateway-owned session."""
@@ -342,6 +350,7 @@ class GatewayAgentFramework(AgentFramework):
         self._mask_unfinished_episode = mask_unfinished_episode
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
+        self._metrics: dict[str, int] = {key: 0 for key in _FRAMEWORK_METRIC_KEYS}
 
     @classmethod
     def from_config(
@@ -502,6 +511,10 @@ class GatewayAgentFramework(AgentFramework):
             )
         return None
 
+    def get_metrics(self) -> dict[str, int]:
+        """Return cumulative framework failures visible to the rollout Tracker."""
+        return dict(self._metrics)
+
     async def _run_batch_rollouts(
         self,
         prompts: TensorDict,
@@ -517,6 +530,8 @@ class GatewayAgentFramework(AgentFramework):
 
         # Batch layer: each sample/prompt owns its own group of rollout.n sessions.
         # Prompt tasks are isolated so one prompt failure does not drop the whole batch.
+        # TODO: honor per-prompt ``__rollout_n__`` (verl agent_loop_tq optional hook)
+        # once uni_agent needs sample-level n. Until then, keep main's batch-level n.
         tasks = []
         for sample_index in range(len(prompts)):
             tasks.append(
@@ -542,6 +557,7 @@ class GatewayAgentFramework(AgentFramework):
         }
         for outcome in outcomes:
             if isinstance(outcome, Exception):
+                self._metrics["generation/unhandled_failure_count"] += 1
                 stats["num_failed_sessions"] += num_sessions
                 stats["num_failed_uids"] += 1
                 failure_reasons.append(_short_failure_reason(outcome))
@@ -592,13 +608,14 @@ class GatewayAgentFramework(AgentFramework):
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
         success_sessions = 0
-        failed_sessions = 0
+        business_failed_sessions = 0
+        tq_write_failed_sessions = 0
         success_outputs = 0
         unfinished_episodes = 0
         failure_reasons: list[str] = []
         for session_index, outcome in enumerate(outcomes):
             if isinstance(outcome, Exception):
-                failed_sessions += 1
+                business_failed_sessions += 1
                 failure_reasons.append(_short_failure_reason(outcome))
                 continue
             # Propagate control-flow exceptions such as CancelledError/SystemExit;
@@ -608,7 +625,7 @@ class GatewayAgentFramework(AgentFramework):
 
             trajectories, session_sample_fields = outcome
             if not trajectories:
-                failed_sessions += 1
+                business_failed_sessions += 1
                 failure_reasons.append(f"empty trajectories for uid={uid} session_index={session_index}")
                 continue
 
@@ -623,7 +640,8 @@ class GatewayAgentFramework(AgentFramework):
                 )
             except Exception as e:
                 logger.exception(f"TQ write failed for uid={uid} session={session_index}: {e}")
-                failed_sessions += 1
+                tq_write_failed_sessions += 1
+                self._metrics["sink/trajectory_write_failure_count"] += 1
                 failure_reasons.append(f"TQ write error: {e}")
             else:
                 success_sessions += 1
@@ -633,12 +651,22 @@ class GatewayAgentFramework(AgentFramework):
                 if any(traj.reward_info.get("finished") is False for traj in trajectories):
                     unfinished_episodes += 1
 
-        if success_sessions > 0:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
-            failed_uids = 0
-        else:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
-            failed_uids = 1
+        failed_sessions = business_failed_sessions + tq_write_failed_sessions
+        terminal_tag = {
+            "status": "finished" if success_sessions > 0 else "failure",
+            "terminal_schema_version": _PROMPT_TERMINAL_SCHEMA_VERSION,
+            "expected_session_count": num_sessions,
+            "successful_session_count": success_sessions,
+            "business_failed_session_count": business_failed_sessions,
+            "tq_write_failed_session_count": tq_write_failed_sessions,
+            "successful_trajectory_count": success_outputs,
+        }
+        try:
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag=terminal_tag)
+        except Exception:
+            self._metrics["sink/prompt_terminal_write_failure_count"] += 1
+            raise
+        failed_uids = int(success_sessions == 0)
 
         return {
             "num_success_sessions": success_sessions,
@@ -746,11 +774,15 @@ class GatewayAgentFramework(AgentFramework):
         tools_kwargs = sample_fields.get("tools_kwargs")
         tools_kwargs = dict(tools_kwargs or {})
         tools_kwargs["_trace_identity"] = trace_identity
+        # Pin the replica to this batch's trainer step. Validation without
+        # global_steps, or any non-int / negative value, stays unversioned.
+        weight_version = global_steps if type(global_steps) is int and global_steps >= 0 else None
         async with _log_scope(parent_log):
             session = await self.gateway_manager.create_session(
                 session_id,
                 metadata={"_trace_identity": trace_identity},
                 sampling_params=dict(sampling_params),
+                weight_version=weight_version,
             )
             logger.info(
                 "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
@@ -857,7 +889,11 @@ class GatewayAgentFramework(AgentFramework):
 
             self._log_trajectory_summary(session_id, result_trajectories)
             if run_dir is not None:
-                await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+                dump_succeeded = await asyncio.to_thread(
+                    self._dump_trajectories, run_dir, session_id, result_trajectories
+                )
+                if not dump_succeeded:
+                    self._metrics["sink/trajectory_dump_failure_count"] += 1
             session_trace.finish(
                 runner_name=runner_name,
                 status="success",
@@ -919,7 +955,7 @@ class GatewayAgentFramework(AgentFramework):
             )
         logger.info("\n".join(lines))
 
-    def _dump_trajectories(self, run_dir: Path, session_id: str, trajectories: list[Trajectory]) -> None:
+    def _dump_trajectories(self, run_dir: Path, session_id: str, trajectories: list[Trajectory]) -> bool:
         """Persist finalized trajectories next to ``task.log``.
 
         Split by cost: a small human-readable summary (reward, turns, lengths) is written
@@ -953,8 +989,10 @@ class GatewayAgentFramework(AgentFramework):
             buf = io.BytesIO()
             np.savez_compressed(buf, **arrays)
             (run_dir / "trajectory.npz").write_bytes(buf.getvalue())
+            return True
         except Exception:
             logger.exception("session %s: failed to write trajectory dump under %s", session_id, run_dir)
+            return False
 
     def _trajectory_meta(self, traj: Trajectory) -> dict[str, object]:
         """Small, human-readable per-trajectory summary; the token arrays live in the npz."""

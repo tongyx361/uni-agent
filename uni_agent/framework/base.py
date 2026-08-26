@@ -21,3 +21,7 @@ class AgentFramework(ABC):
     async def generate_sequences(self, prompts: TensorDict) -> None:
         """Run agent sessions and write finalized trajectories to TransferQueue."""
         ...
+
+    def get_metrics(self) -> dict[str, int | float]:
+        """Return cumulative framework metrics for the rollout Tracker."""
+        raise NotImplementedError(f"{type(self).__name__} does not expose framework metrics")

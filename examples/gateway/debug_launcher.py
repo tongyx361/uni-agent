@@ -80,7 +80,7 @@ class DebugFakeBackend:
 
     async def generate(
         self,
-        request_id: str,
+        session_id: str,
         *,
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
@@ -89,7 +89,7 @@ class DebugFakeBackend:
     ) -> TokenOutput:
         self.calls.append(
             {
-                "request_id": request_id,
+                "session_id": session_id,
                 "prompt_ids": list(prompt_ids),
                 "sampling_params": dict(sampling_params),
                 "image_data": image_data,
@@ -146,7 +146,7 @@ class OpenAICompletionsBackend:
 
     async def generate(
         self,
-        request_id: str,
+        session_id: str,
         *,
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
@@ -157,7 +157,7 @@ class OpenAICompletionsBackend:
             "model": self._backend_model,
             "prompt": list(prompt_ids),
             "max_tokens": sampling_params.get("max_tokens", 16),
-            "request_id": request_id,
+            "request_id": session_id,
             "return_token_ids": True,
             "logprobs": 1,
             "add_special_tokens": False,
@@ -172,7 +172,7 @@ class OpenAICompletionsBackend:
                 status_code = getattr(response, "status_code", "unknown")
                 body = getattr(response, "text", "")
                 raise RuntimeError(
-                    f"OpenAI completions backend request {request_id} failed with HTTP {status_code}: {body}"
+                    f"OpenAI completions backend request {session_id} failed with HTTP {status_code}: {body}"
                 )
             response.raise_for_status()
         body = response.json()

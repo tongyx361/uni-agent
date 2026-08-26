@@ -188,14 +188,14 @@ class InspectingBackend:
         self.calls = []
         self.next_error = None
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         if self.next_error is not None:
             error = self.next_error
             self.next_error = None
             raise error
         self.calls.append(
             {
-                "request_id": request_id,
+                "session_id": session_id,
                 "prompt_ids": list(prompt_ids),
                 "sampling_params": dict(sampling_params),
                 "image_data": image_data,
@@ -204,7 +204,7 @@ class InspectingBackend:
         )
         payload = json.dumps(
             {
-                "request_id": request_id,
+                "session_id": session_id,
                 "prompt_ids": list(prompt_ids),
                 "sampling_params": dict(sampling_params),
                 "image_data": image_data,
@@ -224,12 +224,12 @@ class InspectingSequencedBackend:
     def __init__(self, steps):
         self.steps = list(steps)
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         step = self.steps.pop(0)
         if step == "__inspect__":
             text = json.dumps(
                 {
-                    "request_id": request_id,
+                    "session_id": session_id,
                     "prompt_ids": list(prompt_ids),
                     "sampling_params": dict(sampling_params),
                     "image_data": image_data,
@@ -254,7 +254,7 @@ class QueuedBackend:
     def __init__(self, responses):
         self._responses = list(responses)
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         text = self._responses.pop(0)
         token_ids = [ord(char) for char in text]
         return TokenOutput(
@@ -269,10 +269,10 @@ class RecordingLLMClient:
         self.response_text = response_text
         self.calls = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None, **kwargs):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None, **kwargs):
         self.calls.append(
             {
-                "request_id": request_id,
+                "session_id": session_id,
                 "prompt_ids": list(prompt_ids),
                 "sampling_params": dict(sampling_params),
                 "image_data": image_data,
@@ -293,7 +293,7 @@ class RejectRequestEnvelopeBackend:
         self.response_text = response_text
         self.expected_sampling_params = expected_sampling_params
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         assert "messages" not in sampling_params
         assert "model" not in sampling_params
         assert "tools" not in sampling_params
@@ -314,10 +314,10 @@ class FailingBackend:
         self.error_message = error_message
         self.calls = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         self.calls.append(
             {
-                "request_id": request_id,
+                "session_id": session_id,
                 "prompt_ids": list(prompt_ids),
                 "sampling_params": dict(sampling_params),
                 "image_data": image_data,
@@ -332,10 +332,10 @@ class SequencedBackend:
         self.steps = list(steps)
         self.calls = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         self.calls.append(
             {
-                "request_id": request_id,
+                "session_id": session_id,
                 "prompt_ids": list(prompt_ids),
                 "sampling_params": dict(sampling_params),
                 "image_data": image_data,
@@ -359,7 +359,7 @@ class RecordingConcurrentBackend:
         self._delay = delay
         self.call_windows = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         started_at = asyncio.get_running_loop().time()
         try:
             await asyncio.sleep(self._delay)
@@ -372,4 +372,4 @@ class RecordingConcurrentBackend:
             )
         finally:
             finished_at = asyncio.get_running_loop().time()
-            self.call_windows.append((request_id, started_at, finished_at))
+            self.call_windows.append((session_id, started_at, finished_at))

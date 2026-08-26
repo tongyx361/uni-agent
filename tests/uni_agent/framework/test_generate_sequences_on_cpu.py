@@ -260,6 +260,26 @@ class _FakeTransferQueue:
         )
 
 
+def _terminal_tag(
+    *,
+    expected_sessions: int,
+    successful_sessions: int,
+    successful_trajectories: int,
+    business_failed_sessions: int = 0,
+    tq_write_failed_sessions: int = 0,
+) -> dict[str, int | str]:
+    assert expected_sessions == successful_sessions + business_failed_sessions + tq_write_failed_sessions
+    return {
+        "status": "finished" if successful_sessions else "failure",
+        "terminal_schema_version": 1,
+        "expected_session_count": expected_sessions,
+        "successful_session_count": successful_sessions,
+        "business_failed_session_count": business_failed_sessions,
+        "tq_write_failed_session_count": tq_write_failed_sessions,
+        "successful_trajectory_count": successful_trajectories,
+    }
+
+
 @pytest.fixture
 def fake_tq(monkeypatch):
     from uni_agent.framework import framework as framework_module
@@ -472,6 +492,22 @@ async def test_framework_and_runner_logs_share_one_session_directory(tmp_path, f
 
 
 @pytest.mark.asyncio
+async def test_trajectory_dump_failure_is_counted_without_failing_generation(tmp_path, fake_tq, monkeypatch):
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(framework, "_dump_trajectories", lambda *_args: False)
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=12))
+
+    assert len(fake_tq.batch_puts) == 1
+    assert framework.get_metrics()["sink/trajectory_dump_failure_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_validation_logs_omit_global_step_directory(tmp_path, fake_tq):
     runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
     framework = await _build_framework_with_agent_runners(
@@ -523,6 +559,14 @@ async def test_training_requires_global_steps(fake_tq):
 
     with pytest.raises(ValueError, match=r"prompts\['global_steps'\] for training"):
         await framework.generate_sequences(_build_prompts(count=1, global_steps=None))
+
+    metrics = framework.get_metrics()
+    assert metrics == {
+        "generation/unhandled_failure_count": 0,
+        "sink/trajectory_write_failure_count": 0,
+        "sink/prompt_terminal_write_failure_count": 0,
+        "sink/trajectory_dump_failure_count": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -585,6 +629,7 @@ async def test_framework_binds_sampling_defaults_to_gateway_sessions(
     )
 
     assert [kwargs["sampling_params"] for kwargs in runtime.created_session_kwargs] == [expected_sampling_params]
+    assert [kwargs.get("weight_version") for kwargs in runtime.created_session_kwargs] == [7]
 
 
 @pytest.mark.asyncio
@@ -629,7 +674,13 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
 
     assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
     assert fake_tq.batch_puts[1]["keys"] == ["uid-0_1_0"]
-    assert fake_tq.puts == [{"key": "uid-0", "partition_id": "train", "tag": {"status": "finished"}}]
+    assert fake_tq.puts == [
+        {
+            "key": "uid-0",
+            "partition_id": "train",
+            "tag": _terminal_tag(expected_sessions=2, successful_sessions=2, successful_trajectories=2),
+        }
+    ]
 
     first = fake_tq.batch_puts[0]
     fields = first["fields"]
@@ -730,7 +781,13 @@ async def test_generate_sequences_masks_unfinished_trajectory_without_dropping_i
     assert "finished" not in batch["tags"][0]
     assert "finished" not in batch["fields"].keys()
     assert tu.get(batch["fields"], "reward_extra_info") == [{}]
-    assert fake_tq.puts == [{"key": "uid-0", "partition_id": "train", "tag": {"status": "finished"}}]
+    assert fake_tq.puts == [
+        {
+            "key": "uid-0",
+            "partition_id": "train",
+            "tag": _terminal_tag(expected_sessions=1, successful_sessions=1, successful_trajectories=1),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1068,9 +1125,92 @@ async def test_generate_sequences_keeps_successful_sessions_when_one_session_fai
     await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
 
     assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
-    assert fake_tq.puts == [{"key": "uid-0", "partition_id": "train", "tag": {"status": "finished"}}]
+    assert fake_tq.puts == [
+        {
+            "key": "uid-0",
+            "partition_id": "train",
+            "tag": _terminal_tag(
+                expected_sessions=2,
+                successful_sessions=1,
+                successful_trajectories=1,
+                business_failed_sessions=1,
+            ),
+        }
+    ]
     assert len(runtime.aborted_sessions) == 1
     assert runtime.aborted_sessions[0].startswith("session-sample-0-rollout-1-")
+
+
+@pytest.mark.asyncio
+async def test_generate_sequences_records_trajectory_write_failure_in_terminal_metadata(monkeypatch, fake_tq):
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [_trajectory()],
+            "session-sample-0-rollout-1": [_trajectory()],
+        }
+    )
+    original_batch_put = fake_tq.async_kv_batch_put
+
+    async def fail_second_session(*, keys, fields, tags, partition_id):
+        if keys == ["uid-0_1_0"]:
+            raise OSError("trajectory sink unavailable")
+        await original_batch_put(keys=keys, fields=fields, tags=tags, partition_id=partition_id)
+
+    monkeypatch.setattr(fake_tq, "async_kv_batch_put", fail_second_session)
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        n=2,
+        val_n=2,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert [put["keys"] for put in fake_tq.batch_puts] == [["uid-0_0_0"]]
+    assert fake_tq.puts == [
+        {
+            "key": "uid-0",
+            "partition_id": "train",
+            "tag": _terminal_tag(
+                expected_sessions=2,
+                successful_sessions=1,
+                successful_trajectories=1,
+                tq_write_failed_sessions=1,
+            ),
+        }
+    ]
+    assert framework.get_metrics()["sink/trajectory_write_failure_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_sequences_counts_prompt_terminal_write_failure_without_joining_other_prompt(
+    monkeypatch, fake_tq
+):
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [_trajectory()],
+            "session-sample-1-rollout-0": [_trajectory()],
+        }
+    )
+    original_put = fake_tq.async_kv_put
+
+    async def fail_first_prompt(*, key, partition_id, tag):
+        if key == "uid-0":
+            raise OSError("terminal sink unavailable")
+        await original_put(key=key, partition_id=partition_id, tag=tag)
+
+    monkeypatch.setattr(fake_tq, "async_kv_put", fail_first_prompt)
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=2, global_steps=8))
+
+    assert [put["key"] for put in fake_tq.puts] == ["uid-1"]
+    metrics = framework.get_metrics()
+    assert metrics["sink/prompt_terminal_write_failure_count"] == 1
+    assert metrics["generation/unhandled_failure_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1095,7 +1235,19 @@ async def test_generate_sequences_marks_prompt_failure_when_all_sessions_fail(fa
         await framework.generate_sequences(_build_prompts(count=1, global_steps=9, validate=True))
 
     assert fake_tq.batch_puts == []
-    assert fake_tq.puts == [{"key": "uid-0", "partition_id": "val", "tag": {"status": "failure"}}]
+    assert fake_tq.puts == [
+        {
+            "key": "uid-0",
+            "partition_id": "val",
+            "tag": _terminal_tag(
+                expected_sessions=2,
+                successful_sessions=0,
+                successful_trajectories=0,
+                business_failed_sessions=2,
+            ),
+        }
+    ]
+    assert framework.get_metrics()["generation/unhandled_failure_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1142,8 +1294,21 @@ async def test_generate_sequences_keeps_other_prompts_when_one_prompt_fails(fake
 
     assert [put["keys"] for put in fake_tq.batch_puts] == [["uid-1_0_0"]]
     assert sorted(fake_tq.puts, key=lambda put: put["key"]) == [
-        {"key": "uid-0", "partition_id": "train", "tag": {"status": "failure"}},
-        {"key": "uid-1", "partition_id": "train", "tag": {"status": "finished"}},
+        {
+            "key": "uid-0",
+            "partition_id": "train",
+            "tag": _terminal_tag(
+                expected_sessions=1,
+                successful_sessions=0,
+                successful_trajectories=0,
+                business_failed_sessions=1,
+            ),
+        },
+        {
+            "key": "uid-1",
+            "partition_id": "train",
+            "tag": _terminal_tag(expected_sessions=1, successful_sessions=1, successful_trajectories=1),
+        },
     ]
     assert len(runtime.aborted_sessions) == 1
     assert runtime.aborted_sessions[0].startswith("session-sample-0-rollout-0-")
@@ -1303,3 +1468,39 @@ async def test_ray_task_termination_cancels_runner_and_aborts_session(monkeypatc
     # so no force-kill escalation happened.
     assert [call["force"] for call in cancel_calls] == [False]
     assert runtime.aborted_sessions, "terminated session must be aborted"
+
+
+@pytest.mark.asyncio
+async def test_multi_trajectory_session_is_one_tq_batch(fake_tq):
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_logprobs=[-0.1, -0.2]),
+                _trajectory(
+                    response_ids=[30, 31, 32],
+                    response_mask=[1, 0, 1],
+                    response_logprobs=[-0.3, 0.0, -0.4],
+                    reward_info={"reward": 1.0},
+                ),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"deepeyes": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1))
+
+    assert len(fake_tq.batch_puts) == 1
+    session_write = fake_tq.batch_puts[0]
+    assert session_write["keys"] == ["uid-0_0_0", "uid-0_0_1"]
+    assert [tag["uid"] for tag in session_write["tags"]] == ["uid-0", "uid-0"]
+    assert tu.get(session_write["fields"], "session_id") == [0, 0]
+    assert fake_tq.puts == [
+        {
+            "key": "uid-0",
+            "partition_id": "train",
+            "tag": _terminal_tag(expected_sessions=1, successful_sessions=1, successful_trajectories=2),
+        }
+    ]

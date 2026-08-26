@@ -339,7 +339,7 @@ async def test_openai_completions_backend_generate_sends_prompt_token_ids_and_pa
     )
 
     output = await backend.generate(
-        request_id="s1",
+        session_id="s1",
         prompt_ids=[10, 11, 12],
         sampling_params={
             "max_tokens": 8,
@@ -407,7 +407,7 @@ async def test_openai_completions_backend_requires_token_ids(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="return_token_ids=true"):
-        await backend.generate(request_id="s1", prompt_ids=[1], sampling_params={})
+        await backend.generate(session_id="s1", prompt_ids=[1], sampling_params={})
 
 
 @pytest.mark.asyncio
@@ -446,7 +446,7 @@ async def test_openai_completions_backend_http_error_includes_request_id_and_bod
     )
 
     with pytest.raises(RuntimeError, match="s1.*400.*invalid token ids"):
-        await backend.generate(request_id="s1", prompt_ids=[1], sampling_params={})
+        await backend.generate(session_id="s1", prompt_ids=[1], sampling_params={})
 
 
 @pytest.mark.asyncio

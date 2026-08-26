@@ -1,6 +1,6 @@
 """Driver-side gateway manager: owns the gateway actor pool and routes sessions.
 
-The manager spawns ``GatewayActor`` handles, injects the ``LLMServerClient``
+The manager spawns ``GatewayActor`` handles, injects the LLM client
 backend into each, and tracks which actor owns each session so lifecycle calls
 forward to the right actor through Ray remote methods.
 """
@@ -12,19 +12,18 @@ import asyncio
 import ray
 
 from uni_agent.gateway.config import GatewayActorConfig
-from verl.workers.rollout.llm_server import LLMServerClient
 
 
 class GatewayManager:
     """Owns gateway actors and routes sessions to them.
 
-    Spawns ``gateway_count`` actors over the injected ``LLMServerClient`` backend
+    Spawns ``gateway_count`` actors over the injected LLM client backend
     and tracks which actor owns each session so lifecycle calls reach it.
     """
 
     def __init__(
         self,
-        llm_client: LLMServerClient,
+        llm_client,
         *,
         gateway_count: int,
         gateway_actor_config: GatewayActorConfig | None = None,
@@ -73,7 +72,9 @@ class GatewayManager:
         return self.gateways[gateway_index], gateway_index
 
     async def create_session(self, session_id: str, **kwargs):
-        """Create a session on the least-loaded actor, record the route, and return its handle."""
+        """Create a session on the least-loaded actor and record its owner."""
+        if session_id in self._session_to_gateway_index:
+            raise RuntimeError(f"Session {session_id} already exists")
         gateway_index = self._select_gateway_index()
         gateway = self.gateways[gateway_index]
         # Reserve the slot synchronously, before the await. Sessions are created
@@ -92,19 +93,23 @@ class GatewayManager:
             raise
 
     async def finalize_session(self, session_id: str):
-        """Finalize a session on its owning actor, release the route, and return its trajectories."""
-        gateway, gateway_index = self._get_gateway(session_id)
-        trajectories = await gateway.finalize_session.remote(session_id=session_id)
-        self._session_to_gateway_index.pop(session_id, None)
-        self.active_sessions_per_gateway[gateway_index] -= 1
-        return trajectories
+        """Finalize a session on its owning actor and return its trajectories."""
+        return await self._close_session(session_id, finalize=True)
 
     async def abort_session(self, session_id: str) -> None:
-        """Abort a routed session on its owning actor and release the route."""
+        """Abort a session on its owning actor."""
+        await self._close_session(session_id, finalize=False)
+
+    async def _close_session(self, session_id: str, *, finalize: bool):
         gateway, gateway_index = self._get_gateway(session_id)
-        await gateway.abort_session.remote(session_id=session_id)
+        if finalize:
+            result = await gateway.finalize_session.remote(session_id=session_id)
+        else:
+            result = await gateway.abort_session.remote(session_id=session_id)
+
         self._session_to_gateway_index.pop(session_id, None)
         self.active_sessions_per_gateway[gateway_index] -= 1
+        return result
 
     async def shutdown(self) -> None:
         """Stop owned gateway actors and clear routing state."""

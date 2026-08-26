@@ -100,7 +100,7 @@ class _LogprobBackend:
     def __init__(self, steps):
         self.steps = list(steps)
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         text, log_probs = self.steps.pop(0)
         token_ids = _ids(text)
         if log_probs == "full":
@@ -114,8 +114,12 @@ class _VersionedBackend:
     def __init__(self, steps):
         # steps: list of (text, min_global_steps, max_global_steps)
         self.steps = list(steps)
+        self.calls = []
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(
+        self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None, weight_version=None
+    ):
+        self.calls.append({"session_id": session_id, "weight_version": weight_version})
         text, min_steps, max_steps = self.steps.pop(0)
         token_ids = _ids(text)
         return TokenOutput(
@@ -132,10 +136,10 @@ class _ControlledParallelBackend:
         self.calls = []
         self._call_added = asyncio.Event()
 
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+    async def generate(self, session_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
         step = self.steps.pop(0)
         call = {
-            "request_id": request_id,
+            "session_id": session_id,
             "prompt_ids": list(prompt_ids),
             "sampling_params": dict(sampling_params),
             "image_data": image_data,
@@ -787,7 +791,7 @@ async def test_multiple_chains_reserved_siblings_fall_back_before_starting_new_c
         await backend.wait_for_calls(call_count)
 
     assert session.snapshot_state()["active_chain_ids"] == [1, 2, 3]
-    assert [call["request_id"] for call in backend.calls] == ["reserved-siblings"] * 4
+    assert [call["session_id"] for call in backend.calls] == ["reserved-siblings"] * 4
 
     for index in (3, 2, 1, 0):
         backend.release_call(index)
@@ -844,7 +848,7 @@ async def test_multiple_chains_parallel_different_chains_commit_in_place():
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_parallel_new_siblings_reuse_session_request_id():
+async def test_multiple_chains_parallel_new_siblings_reuse_session_id():
     """Retain concurrent first-turn siblings while reusing the sticky session id."""
     session = _session("parallel-new-siblings")
     backend = _ControlledParallelBackend(["A", "B", "C"])
@@ -856,8 +860,8 @@ async def test_multiple_chains_parallel_new_siblings_reuse_session_request_id():
         backend.release_call(index)
     await asyncio.gather(*tasks)
 
-    request_ids = [call["request_id"] for call in backend.calls]
-    assert request_ids == ["parallel-new-siblings"] * 3
+    session_ids = [call["session_id"] for call in backend.calls]
+    assert session_ids == ["parallel-new-siblings"] * 3
     assert session.snapshot_state()["active_chain_ids"] == [1, 2, 3]
     trajectories = await session.finalize()
     assert sorted(_decode_response_ids(trajectory.response_ids) for trajectory in trajectories) == ["A", "B", "C"]
@@ -1817,3 +1821,65 @@ async def test_weight_versions_absent_when_backend_omits_them():
     [trajectory] = await session.finalize()
 
     assert trajectory.extra_fields == {}
+
+
+@pytest.mark.asyncio
+async def test_session_rejects_backend_version_conflicting_with_weight_version():
+    session = GatewaySession(
+        SessionHandle(session_id="session-version-conflict"),
+        MessageCodec(FakeTokenizer()),
+        weight_version=3,
+    )
+
+    with pytest.raises(RuntimeError, match="backend generation version conflicts with session weight_version"):
+        await _run(
+            session,
+            _VersionedBackend([("OK", 4, 4)]),
+            [{"role": "user", "content": "hello"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_versioned_sibling_chains_share_session_route_and_version():
+    session = GatewaySession(
+        SessionHandle(session_id="session-versioned-siblings"),
+        MessageCodec(FakeTokenizer()),
+        weight_version=3,
+    )
+    backend = _VersionedBackend(
+        [
+            ("FIRST", 3, 3),
+            ("SIBLING", 3, 3),
+            ("FIRST-NEXT", 3, 3),
+            ("SIBLING-NEXT", 3, 3),
+        ]
+    )
+    prompt = [{"role": "user", "content": "same prompt"}]
+
+    await _run(session, backend, prompt)
+    await _run(session, backend, prompt)
+    await _run(
+        session,
+        backend,
+        [*prompt, {"role": "assistant", "content": "FIRST"}, {"role": "user", "content": "continue first"}],
+    )
+    await _run(
+        session,
+        backend,
+        [
+            *prompt,
+            {"role": "assistant", "content": "SIBLING"},
+            {"role": "user", "content": "continue sibling"},
+        ],
+    )
+
+    assert backend.calls == [{"session_id": "session-versioned-siblings", "weight_version": 3}] * 4
+    trajectories = await session.finalize()
+    decoded = [_decode_response_ids(trajectory.response_ids) for trajectory in trajectories]
+    assert len(decoded) == 2
+    assert any(text.startswith("FIRST") and text.endswith("FIRST-NEXT") for text in decoded)
+    assert any(text.startswith("SIBLING") and text.endswith("SIBLING-NEXT") for text in decoded)
+    assert {
+        (trajectory.extra_fields["min_global_steps"], trajectory.extra_fields["max_global_steps"])
+        for trajectory in trajectories
+    } == {(3, 3)}

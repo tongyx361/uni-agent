@@ -50,9 +50,8 @@ class TrajectoryBuffer:
             value covers the whole sequence (mirrors verl's tool_agent_loop).
         generation_versions: One ``(min_global_steps, max_global_steps)`` mark
             per generation, in generation order. Rollback drops the last mark
-            with the tokens it describes, so a dropped assistant no longer
-            widens the trajectory's version span. Marks carry ``None`` when the
-            backend reports no version.
+            with the tokens it describes. Marks carry ``None`` when an
+            unversioned backend reports no version.
     """
 
     prompt_ids: list[int]
@@ -183,12 +182,15 @@ class GatewaySession:
         sampling_params: dict[str, Any] | None = None,
         enable_last_assistant_rollback: bool = True,
         metadata: dict[str, Any] | None = None,
+        weight_version: int | None = None,
     ):
         """Create an active session bound to a handle and model codec."""
         if prompt_length is not None and prompt_length <= 0:
             raise ValueError(f"prompt_length must be positive when set, got {prompt_length}")
         if response_length is not None and response_length <= 0:
             raise ValueError(f"response_length must be positive when set, got {response_length}")
+        if weight_version is not None and (type(weight_version) is not int or weight_version < 0):
+            raise ValueError(f"weight_version must be a non-negative integer when set, got {weight_version!r}")
 
         self.handle = handle
         self._codec = codec
@@ -201,6 +203,7 @@ class GatewaySession:
         self._enable_last_assistant_rollback = enable_last_assistant_rollback
         self._metadata = dict(metadata or {})
         self._trace_identity = dict(self._metadata.get("_trace_identity") or {})
+        self._weight_version = weight_version
         self.active_chains: list[ChainState] = []
         self.materialized_chains: list[MaterializedChain] = []
         self.reserved_chain_ids: set[int] = set()
@@ -264,25 +267,33 @@ class GatewaySession:
                     reserved_chain_id = encoded.chain_id
 
             try:
-                output = await backend.generate(
-                    request_id=self.handle.session_id,
-                    prompt_ids=encoded.context_ids,
-                    sampling_params=encoded.sampling_params,
-                    image_data=encoded.image_data,
-                    video_data=encoded.video_data,
-                )
+                backend_kwargs = {
+                    "prompt_ids": encoded.context_ids,
+                    "sampling_params": encoded.sampling_params,
+                    "image_data": encoded.image_data,
+                    "video_data": encoded.video_data,
+                }
+                if self._weight_version is not None:
+                    backend_kwargs["weight_version"] = self._weight_version
+                output = await backend.generate(session_id=self.handle.session_id, **backend_kwargs)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}") from e
 
             response_ids = list(output.token_ids)
-            encoded.buffer.generation_versions.append(
-                (
-                    output.extra_fields.get("min_global_steps"),
-                    output.extra_fields.get("max_global_steps"),
-                )
+
+            generation_version = (
+                output.extra_fields.get("min_global_steps"),
+                output.extra_fields.get("max_global_steps"),
             )
+            if self._weight_version is not None and generation_version != (self._weight_version, self._weight_version):
+                raise RuntimeError(
+                    "backend generation version conflicts with session weight_version: "
+                    f"expected {(self._weight_version, self._weight_version)!r}, got {generation_version!r}"
+                )
+            encoded.buffer.generation_versions.append(generation_version)
+
             encoded.buffer.response_ids.extend(response_ids)
             encoded.buffer.response_mask.extend([1] * len(response_ids))
             if encoded.sampling_params.get("logprobs", False):
@@ -352,6 +363,7 @@ class GatewaySession:
             if self.phase != SessionPhase.ACTIVE:
                 raise RuntimeError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
             if reward_info is not None:
+                # TODO: Validate reward data and reject conflicting writes if Gateway reward reporting is re-enabled.
                 self.reward_info = dict(reward_info)
             self._touch()
 
@@ -678,6 +690,7 @@ class GatewaySession:
         video_data: list[Any] | None,
         tip_hash: str,
     ) -> LastAssistantStart:
+        """TODO: This method seems redundant. Remove it later."""
         return LastAssistantStart(
             response_ids_len=len(buffer.response_ids),
             message_history_len=message_history_len,
