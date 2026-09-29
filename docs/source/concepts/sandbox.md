@@ -64,6 +64,7 @@ The shared lifecycle uses:
 
 - `SANDBOX_STARTUP_TIMEOUT`: startup timeout, 600 seconds by default.
 - `SANDBOX_STARTUP_CONCURRENCY`: process-wide startup limit, 64 by default.
+- `SANDBOX_STOP_TIMEOUT`: timeout for the cleanup `stop()` after a failed or cancelled start, 120 seconds by default. Cancellation waits for this cleanup, so the bound keeps a hung provider from blocking it forever.
 
 Remote providers should implement `is_alive()` as a non-throwing health probe.
 

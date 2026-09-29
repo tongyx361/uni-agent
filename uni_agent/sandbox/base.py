@@ -191,6 +191,7 @@ class SandboxBackend(Protocol):
 
 _DEFAULT_STARTUP_TIMEOUT = 600.0
 _DEFAULT_STARTUP_CONCURRENCY = 64
+_DEFAULT_STOP_TIMEOUT = 120.0
 # Per-process startup semaphores, created lazily per event loop so
 # each binds to the loop that uses it and is *shared* across concurrent start()s.
 _startup_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -228,6 +229,47 @@ async def _startup_slot() -> AsyncIterator[None]:
         _startup_semaphores[loop] = entry
     async with entry[1]:
         yield
+
+
+async def _stop_after_failed_start(sandbox: Sandbox) -> None:
+    """Best-effort ``stop()`` after a failed or cancelled ``start()``.
+
+    ``async with`` does not call ``__aexit__`` when ``__aenter__`` itself fails,
+    so this is the only teardown for a container ``start()`` already created.
+    Bounded by ``SANDBOX_STOP_TIMEOUT`` (``<=0`` disables): the caller keeps
+    waiting through cancellation, so a hung ``stop()`` would never let it exit.
+    """
+    timeout = _env_number("SANDBOX_STOP_TIMEOUT", _DEFAULT_STOP_TIMEOUT)
+    try:
+        await asyncio.wait_for(sandbox.stop(), timeout=timeout if timeout > 0 else None)
+    except asyncio.TimeoutError:
+        logger.warning("sandbox stop() exceeded SANDBOX_STOP_TIMEOUT=%gs during start() cleanup", timeout)
+    except Exception:
+        logger.warning("sandbox stop() failed during start() cleanup", exc_info=True)
+
+
+async def _stop_after_failed_start_shielded(sandbox: Sandbox) -> None:
+    """Finish ``stop()`` even when this task is cancelled again during teardown.
+
+    ``asyncio.shield`` keeps the cleanup task alive, but the outer await still
+    raises ``CancelledError``. Keep waiting until ``stop()`` finishes, then
+    propagate that cancellation.
+    """
+    stop_task = asyncio.create_task(_stop_after_failed_start(sandbox))
+    cancelled = False
+    while not stop_task.done():
+        try:
+            await asyncio.shield(stop_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if not cancelled:
+        await stop_task
+        return
+    try:
+        await stop_task
+    except asyncio.CancelledError:
+        pass
+    raise asyncio.CancelledError()
 
 
 class Sandbox(abc.ABC):
@@ -297,7 +339,9 @@ class Sandbox(abc.ABC):
 
         Each attempt holds one startup slot (``SANDBOX_STARTUP_CONCURRENCY``)
         and is bounded by ``SANDBOX_STARTUP_TIMEOUT``; the slot is released before the
-        retry backoff and the cleanup ``stop()``.
+        retry backoff and the cleanup ``stop()``. Cancellation is not retried:
+        ``CancelledError`` is a ``BaseException`` on Python 3.10+, and a cancelled
+        enter must still ``stop()`` or the partial sandbox leaks.
         """
         retry = max(1, retry)
         last_exc: BaseException | None = None
@@ -308,10 +352,14 @@ class Sandbox(abc.ABC):
                 return self
             except Exception as exc:
                 last_exc = exc
-                try:
-                    await self.stop()
-                except Exception:
-                    logger.warning("sandbox stop() failed during start() cleanup", exc_info=True)
+                await _stop_after_failed_start_shielded(self)
+            except BaseException:
+                # Not retried. async with skips __aexit__ when enter itself
+                # is cancelled, so stop() here is what releases a container
+                # start() already created. Shield it so a second cancel
+                # cannot abandon that teardown.
+                await _stop_after_failed_start_shielded(self)
+                raise
             logger.warning("sandbox failed to start (attempt %d/%d): %r", attempt, retry, last_exc)
             if attempt < retry:
                 await asyncio.sleep(2 * attempt)
