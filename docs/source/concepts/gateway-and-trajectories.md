@@ -419,3 +419,13 @@ Customize the layer that owns the behavior:
 - Customize reward scoring in the Task or a verl Reward Loop Worker.
 
 Do not put Task logic inside Gateway routes or bypass the Gateway token buffers when training-format trajectories are required.
+
+### Runner scoring context
+
+Framework preserves the runner's original scoring evidence in each trajectory's
+`extra_fields.runner_reward_info`: `reward` contains the runner reward, `metrics`
+contains `acc` when available, and `reward_context` contains `TaskResult.extra_info`.
+This context is independent of final reward-worker scores and training masks.
+For SWE-bench, the context includes `eval_exit_code`, per-test
+`eval_report.status_map`, and an `agent_error` when the agent reports one.
+These diagnostics do not change the task's resolution criteria.

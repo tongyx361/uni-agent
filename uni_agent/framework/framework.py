@@ -239,6 +239,25 @@ def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorD
     return td
 
 
+def _attach_runner_reward_info(trajectories: list[Trajectory], task_result: TaskResult) -> list[Trajectory]:
+    """Preserve runner scoring context separately from final reward metrics."""
+    task_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
+    return [
+        replace(
+            traj,
+            extra_fields={
+                **traj.extra_fields,
+                "runner_reward_info": {
+                    "reward": task_result.reward,
+                    "metrics": dict(task_metrics),
+                    "reward_context": dict(task_result.extra_info),
+                },
+            },
+        )
+        for traj in trajectories
+    ]
+
+
 def _trajectory_to_reward_dataproto(trajectory, sample_fields, task_result: TaskResult):
     """Build a single-sample DataProto for RewardLoopWorker.compute_score.
 
@@ -916,6 +935,8 @@ class GatewayAgentFramework(AgentFramework):
                     )
                     for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
                 ]
+
+            result_trajectories = _attach_runner_reward_info(result_trajectories, task_result)
 
             self._log_trajectory_summary(session_id, result_trajectories)
             if run_dir is not None:
