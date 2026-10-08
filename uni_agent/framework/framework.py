@@ -586,9 +586,11 @@ class GatewayAgentFramework(AgentFramework):
             partition_id=partition_id,
             sample_fields=sample_fields,
         )
-        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
         tasks = []
         try:
+            # Settle the initial write before a cancellation writes the terminal
+            # tag, so a late TransferQueue acknowledgement cannot leave it running.
+            await self._put_uid_status(uid=uid, partition_id=partition_id, status="running")
             for session_index in range(num_sessions):
                 task = await self._submit_agent_episode(
                     sample_fields=sample_fields,
@@ -737,6 +739,18 @@ class GatewayAgentFramework(AgentFramework):
             failure_reasons.extend(outcome["failure_reasons"])
         return stats
 
+    @staticmethod
+    async def _settle_cleanup(cleanup: asyncio.Future) -> bool:
+        """Finish owned cleanup despite repeated cancellation; return whether the caller was cancelled."""
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        return cancelled
+
     async def _abandon_admission_lanes(self, lane_tasks: list[asyncio.Task]) -> None:
         """Cancel admission lanes and wait until each in-flight prompt has settled.
 
@@ -744,13 +758,12 @@ class GatewayAgentFramework(AgentFramework):
         marks its uid failed; shield the drain so a second cancel cannot skip it.
         """
         for task in lane_tasks:
-            task.cancel()
+            cancelling = getattr(task, "cancelling", None)
+            if cancelling is None or not cancelling():
+                task.cancel()
         drain = asyncio.gather(*lane_tasks, return_exceptions=True)
-        try:
-            await asyncio.shield(drain)
-        except asyncio.CancelledError:
-            await drain
-            raise
+        if await self._settle_cleanup(drain):
+            raise asyncio.CancelledError()
 
     async def _abandon_prompt_collectors(self, tasks: list[asyncio.Task]) -> None:
         """Cancel prompt collectors admitted before a batch-level cancel and wait them out.
@@ -760,15 +773,15 @@ class GatewayAgentFramework(AgentFramework):
         """
         pending = [task for task in tasks if not task.done()]
         for task in pending:
-            task.cancel()
+            cancelling = getattr(task, "cancelling", None)
+            if cancelling is None or not cancelling():
+                task.cancel()
         if not pending:
             return
         drain = asyncio.gather(*pending, return_exceptions=True)
         try:
-            await asyncio.shield(drain)
-        except asyncio.CancelledError:
-            await drain
-            raise
+            if await self._settle_cleanup(drain):
+                raise asyncio.CancelledError()
         except Exception:
             logger.exception("failed to drain prompt collectors abandoned during batch admission")
 
@@ -785,21 +798,21 @@ class GatewayAgentFramework(AgentFramework):
         stays at ``running`` with nobody left to write a terminal status.
         """
         for task in tasks:
-            task.cancel()
+            cancelling = getattr(task, "cancelling", None)
+            if cancelling is None or not cancelling():
+                task.cancel()
         # Keep the gather task so a second cancel can still finish the drain
         # before the terminal status write, matching _abandon_prompt_collectors.
         drain = asyncio.gather(*tasks, return_exceptions=True) if tasks else None
+        cancelled = False
         try:
             if drain is not None:
-                await asyncio.shield(drain)
-        except asyncio.CancelledError:
-            if drain is not None:
-                await drain
-            await self._put_uid_status(uid=uid, partition_id=partition_id, status="failure", log_failure=True)
-            raise
+                cancelled = await self._settle_cleanup(drain)
         except Exception:
             logger.exception("uid %s: failed to drain episodes abandoned during admission", uid)
         await self._put_uid_status(uid=uid, partition_id=partition_id, status="failure", log_failure=True)
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _put_uid_status(
         self,
@@ -811,19 +824,19 @@ class GatewayAgentFramework(AgentFramework):
     ) -> None:
         """Write a uid status, finishing the put if this task is cancelled mid-write.
 
-        Admission and collector cancellation both need a terminal tag. Shielding
-        the put keeps a second cancel from leaving TransferQueue at ``running``.
+        Initial and terminal writes must retain their ordering, even when the
+        caller is cancelled repeatedly while the remote put is still running.
         """
         put = asyncio.create_task(tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status}))
+        cancelled = False
         try:
-            await asyncio.shield(put)
-        except asyncio.CancelledError:
-            await put
-            raise
+            cancelled = await self._settle_cleanup(put)
         except Exception:
             if not log_failure:
                 raise
             logger.exception("uid %s: failed to mark status %s", uid, status)
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _collect_prompt_rollouts(
         self,
@@ -1066,7 +1079,9 @@ class GatewayAgentFramework(AgentFramework):
                             timeout=runner_config.session_timeout_seconds,
                         )
                     except (asyncio.TimeoutError, asyncio.CancelledError):
-                        await self._cancel_runner_task(object_ref, session_id)
+                        cleanup = asyncio.ensure_future(self._cancel_runner_task(object_ref, session_id))
+                        if await self._settle_cleanup(cleanup):
+                            raise asyncio.CancelledError() from None
                         raise
                 else:
                     runner = self._inline_runners[runner_name]
@@ -1092,7 +1107,8 @@ class GatewayAgentFramework(AgentFramework):
                 # Parent shutdown/cancellation must not leave the Gateway route
                 # and actor-owned session live after the runner task is gone.
                 try:
-                    await asyncio.shield(self.gateway_manager.abort_session(session_id))
+                    abort = asyncio.ensure_future(self.gateway_manager.abort_session(session_id))
+                    await self._settle_cleanup(abort)
                 except Exception:
                     logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
                 raise
