@@ -28,13 +28,15 @@ def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commi
     base_commit = instance["base_commit"]
     test_files = get_modified_files(test_patch)
     if test_files:
-        reset_tests_command = f"git checkout {shlex.quote(base_commit)} -- {shlex.join(test_files)} || exit $?"
+        test_paths = shlex.join([f":(literal){path}" for path in test_files])
+        reset_tests_command = f"git checkout {shlex.quote(base_commit)} -- {test_paths} || exit $?"
     else:
         reset_tests_command = "echo 'skip reset'"
 
-    added_test_files = [file.path for file in PatchSet(test_patch) if file.is_added_file]
+    added_test_files = [file.path for file in PatchSet(test_patch) if file.is_added_file or file.is_rename]
+    added_test_paths = shlex.join([f":(literal){path}" for path in added_test_files])
     remove_added_tests_command = (
-        f"git clean -fx -- {shlex.join([f':(literal){path}' for path in added_test_files])} || exit $?"
+        f"git rm -rf --ignore-unmatch -- {added_test_paths} || exit $?\ngit clean -fx -- {added_test_paths} || exit $?"
         if added_test_files
         else "echo 'skip added tests cleanup'"
     )
@@ -68,6 +70,7 @@ def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commi
         test_command,
         f": '{END_TEST_OUTPUT}'",
         reset_tests_command,
+        remove_added_tests_command,
     ]
     return eval_commands
 
