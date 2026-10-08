@@ -256,8 +256,15 @@ class _GatewayActor:
         session_id: str,
         metadata: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
+        weight_version: int | None = None,
     ) -> SessionHandle:
-        """Create a session and bind its optional backend route before publishing it."""
+        """Create an actor-owned session, optionally bind its route, and return its handle.
+
+        ``weight_version`` is enforced on generations only when the backend binds
+        routes; other backends ignore it. It is the lowest acceptable version:
+        a ``bind_route`` that returns an int bound that (possibly newer) version,
+        and the session enforces the returned one. ``None`` leaves it unpinned.
+        """
         self._require_started()
         if session_id in self._sessions:
             raise RuntimeError(f"Session {session_id} already exists")
@@ -276,10 +283,18 @@ class _GatewayActor:
             enable_last_assistant_rollback=self._enable_last_assistant_rollback,
             coalesce_reserved_exact_requests=self._coalesce_reserved_exact_requests,
             metadata=metadata,
+            # Only bind_route can pin the replica version. Plain rollout clients
+            # stamp the version the server currently serves, which lags the batch
+            # step in verl v1 trainers, so enforcing it would reject every request.
+            weight_version=weight_version if bind_route is not None else None,
         )
         if bind_route is not None:
             try:
-                await bind_route(session_id=session_id)
+                bound_version = await bind_route(session_id=session_id, weight_version=weight_version)
+                # Sessions wait for runner admission after dispatch picked the
+                # version, so the backend may bind a newer loadable one.
+                if weight_version is not None:
+                    self._sessions[session_id].adopt_bound_weight_version(bound_version)
             except BaseException:
                 # Manager drops its routing entry when create fails. Drop the
                 # actor session too, or this id stays occupied and cannot be

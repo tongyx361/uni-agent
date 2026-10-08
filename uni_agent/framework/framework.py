@@ -795,11 +795,16 @@ class GatewayAgentFramework(AgentFramework):
         tools_kwargs = sample_fields.get("tools_kwargs")
         tools_kwargs = dict(tools_kwargs or {})
         tools_kwargs["_trace_identity"] = trace_identity
+        # Route-binding backends pin the replica to this batch's trainer step or,
+        # when the session waited for admission past that version, a newer one.
+        # Validation without global_steps, or any non-int / negative value, stays unversioned.
+        weight_version = global_steps if type(global_steps) is int and global_steps >= 0 else None
         async with _log_scope(parent_log):
             session = await self.gateway_manager.create_session(
                 session_id,
                 metadata={"_trace_identity": trace_identity},
                 sampling_params=dict(sampling_params),
+                weight_version=weight_version,
             )
             logger.info(
                 "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",

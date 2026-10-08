@@ -1229,6 +1229,7 @@ async def test_framework_binds_sampling_defaults_to_gateway_sessions(
     )
 
     assert [kwargs["sampling_params"] for kwargs in runtime.created_session_kwargs] == [expected_sampling_params]
+    assert [kwargs.get("weight_version") for kwargs in runtime.created_session_kwargs] == [7]
 
 
 @pytest.mark.cpu
