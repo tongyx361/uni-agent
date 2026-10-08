@@ -73,25 +73,85 @@ def test_real_ray_snapshot_while_default_generation_slots_are_saturated(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_adapter_combines_session_and_live_model_metrics():
+async def test_adapter_combines_terminal_task_and_live_model_metrics():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
     adapter = entry_module.AgentFrameworkRolloutAdapter()
     adapter.framework_worker = SimpleNamespace(
         get_efficiency_metrics=SimpleNamespace(
-            remote=AsyncMock(return_value={"sessions/admitted": 3.0, "admission/wait_s": 12.0})
+            remote=AsyncMock(return_value={"task_reports/count": 3.0, "tool/total_s": 12.0})
         )
     )
     adapter.gateway_manager = SimpleNamespace(
         get_efficiency_metrics=AsyncMock(return_value={"model/output_tokens": 100.0, "model/requests_in_flight": 2.0})
     )
     assert await adapter.get_efficiency_metrics() == {
-        "sessions/admitted": 3.0,
-        "admission/wait_s": 12.0,
+        "task_reports/count": 3.0,
+        "tool/total_s": 12.0,
         "model/output_tokens": 100.0,
         "model/requests_in_flight": 2.0,
     }
+
+
+async def _efficiency_failing_runner(**kwargs):
+    from uni_agent.efficiency import measure_efficiency
+
+    with measure_efficiency("sandbox_startup"):
+        await asyncio.sleep(0)
+        raise TimeoutError("expected startup failure")
+
+
+def test_real_ray_runner_reports_to_waiting_worker():
+    import os
+
+    import ray
+
+    from uni_agent.framework.framework import _run_agent_runner_ray_task
+
+    class WaitingWorker(entry_module.AgentFrameworkWorker.__ray_metadata__.modified_class):
+        def __init__(self):
+            self.framework = _build_framework()
+
+        async def run(self):
+            try:
+                await _run_agent_runner_ray_task.remote(
+                    runner_fqn=f"{__name__}._efficiency_failing_runner",
+                    runner_kwargs={},
+                    raw_prompt=[],
+                    session=None,
+                    sample_index=0,
+                    tools_kwargs=None,
+                    log_context=None,
+                    efficiency_sink=ray.get_runtime_context().current_actor,
+                )
+            except ray.exceptions.RayTaskError:
+                return self.framework.get_efficiency_metrics()
+            raise AssertionError("runner unexpectedly succeeded")
+
+    owns_ray = not ray.is_initialized()
+    if owns_ray:
+        ray.init(address="local", num_cpus=1, include_dashboard=False)
+    worker = None
+    try:
+        # Pytest imports this directory as a top-level module; let child workers
+        # resolve that same module when deserializing the test actor and runner.
+        pythonpath = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        # The production callback uses the efficiency concurrency group.
+        worker = (
+            ray.remote(concurrency_groups={"efficiency": 1})(WaitingWorker)
+            .options(runtime_env={"env_vars": {"PYTHONPATH": pythonpath}})
+            .remote()
+        )
+        metrics = ray.get(worker.run.remote(), timeout=45)
+        assert metrics["task_reports/count"] == 1
+        assert metrics["sandbox_startup/error_count"] == 1
+        assert metrics["sandbox_startup/count"] == 1
+    finally:
+        if worker is not None:
+            ray.kill(worker)
+        if owns_ray:
+            ray.shutdown()
 
 
 @pytest.mark.asyncio
