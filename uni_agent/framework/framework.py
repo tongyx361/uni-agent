@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
@@ -342,6 +343,8 @@ class GatewayAgentFramework(AgentFramework):
         trajectory_postprocessor_kwargs: dict[str, object] | None = None,
     ):
         self.gateway_manager = gateway_manager
+        # Snapshot RPCs run on the efficiency group's thread.
+        self._efficiency_lock = threading.Lock()
         self._admission_wait_s = 0.0
         self._admitted_sessions = 0
         self._completed_sessions = 0
@@ -509,13 +512,13 @@ class GatewayAgentFramework(AgentFramework):
         return sampling_params
 
     def get_efficiency_metrics(self) -> dict[str, float]:
-        metrics = {}
-        # Admission counters and snapshots run on the default-group loop.
-        metrics["admission/wait_s"] = self._admission_wait_s
-        metrics["sessions/admitted"] = float(self._admitted_sessions)
-        metrics["sessions/completed"] = float(self._completed_sessions)
-        metrics["sessions/in_flight"] = float(self._admitted_sessions - self._completed_sessions)
-        return metrics
+        with self._efficiency_lock:
+            return {
+                "admission/wait_s": self._admission_wait_s,
+                "sessions/admitted": float(self._admitted_sessions),
+                "sessions/completed": float(self._completed_sessions),
+                "sessions/in_flight": float(self._admitted_sessions - self._completed_sessions),
+            }
 
     async def generate_sequences(self, prompts: TensorDict) -> None:
         """Run rollout-manager generation and write outputs into TransferQueue."""
@@ -744,7 +747,8 @@ class GatewayAgentFramework(AgentFramework):
 
         runner_cap = runner_config.max_concurrent_sessions
         if runner_cap <= 0:
-            self._admitted_sessions += 1
+            with self._efficiency_lock:
+                self._admitted_sessions += 1
             try:
                 return await self._run_agent_episode(
                     sample_fields=sample_fields,
@@ -756,7 +760,8 @@ class GatewayAgentFramework(AgentFramework):
                     sampling_params=sampling_params,
                 )
             finally:
-                self._completed_sessions += 1
+                with self._efficiency_lock:
+                    self._completed_sessions += 1
 
         runner_semaphore = self._runner_semaphores.get(runner_name)
         if runner_semaphore is None:
@@ -767,8 +772,10 @@ class GatewayAgentFramework(AgentFramework):
         try:
             await runner_semaphore.acquire()
         finally:
-            self._admission_wait_s += time.perf_counter() - wait_started
-        self._admitted_sessions += 1
+            with self._efficiency_lock:
+                self._admission_wait_s += time.perf_counter() - wait_started
+        with self._efficiency_lock:
+            self._admitted_sessions += 1
         try:
             return await self._run_agent_episode(
                 sample_fields=sample_fields,
@@ -780,7 +787,8 @@ class GatewayAgentFramework(AgentFramework):
                 sampling_params=sampling_params,
             )
         finally:
-            self._completed_sessions += 1
+            with self._efficiency_lock:
+                self._completed_sessions += 1
             runner_semaphore.release()
 
     async def _run_agent_episode(
