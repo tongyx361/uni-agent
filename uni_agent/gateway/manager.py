@@ -124,29 +124,34 @@ class GatewayManager:
         except asyncio.CancelledError:
             # The manager is the only owner that can abort this session later.
             # Finish the cleanup even if the caller is cancelled again meanwhile.
-            cleanup = asyncio.ensure_future(self._abort_cancelled_create(gateway, session_id, create))
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await cleanup
-            finally:
-                self._drop_route(session_id, gateway_index)
+            cleanup = asyncio.ensure_future(self._abort_cancelled_create(session_id, gateway_index, create))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # Every wait must stay shielded: a later cancellation would
+                    # otherwise cancel cleanup while the actor is still creating.
+                    continue
+            cleanup.result()
             raise
         except BaseException:
             self._drop_route(session_id, gateway_index)
             raise
 
-    async def _abort_cancelled_create(self, gateway, session_id: str, create: asyncio.Future) -> None:
+    async def _abort_cancelled_create(self, session_id: str, gateway_index: int, create: asyncio.Future) -> None:
         """Abort the session that a cancelled ``create_session`` call still created."""
         try:
             await create
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # A failed create (the actor discards it on bind_route failure) left
             # nothing of this call to abort; an existing session is not ours.
+            self._drop_route(session_id, gateway_index)
             return
         try:
-            await gateway.abort_session.remote(session_id=session_id)
-        except Exception:
+            # Reuse normal abort ownership: a failure before actor removal keeps
+            # this route available for an explicit retry instead of orphaning it.
+            await self.abort_session(session_id)
+        except (Exception, asyncio.CancelledError):
             logger.exception("session %s: abort failed after cancelled create", session_id)
 
     async def finalize_session(self, session_id: str):

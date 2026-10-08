@@ -290,13 +290,9 @@ class _GatewayActor:
         return handle
 
     async def _discard_session_after_failed_bind(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
-        release_route = getattr(self._backend, "release_route", None)
-        if release_route is None:
-            return
         try:
-            await asyncio.shield(release_route(session_id=session_id))
-        except Exception:
+            await self._remove_session(session_id)
+        except (Exception, asyncio.CancelledError):
             logger.exception("session %s: route release failed after bind_route failure", session_id)
 
     async def finalize_session(self, session_id: str) -> list[Trajectory]:
@@ -340,11 +336,15 @@ class _GatewayActor:
         # ensure_future, not create_task: backends such as Laminar's
         # LLMServerClient return a Ray ObjectRef, which is awaitable but not a coroutine.
         release_task = asyncio.ensure_future(release_route(session_id=session_id))
-        try:
-            await asyncio.shield(release_task)
-        except asyncio.CancelledError:
-            await release_task
-            raise
+        cancelled = False
+        while not release_task.done():
+            try:
+                await asyncio.shield(release_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        release_task.result()
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def get_session_state(self, session_id: str) -> dict[str, Any]:
         """Return a snapshot of a live session's state."""

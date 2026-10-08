@@ -419,6 +419,51 @@ async def test_gateway_manager_cancelled_create_aborts_what_the_actor_created(cr
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+async def test_gateway_manager_cancelled_create_retains_owner_after_abort_failure():
+    gateway = _SlowCreateGateway()
+    gateway.abort_error = RuntimeError("session abort failed before removal")
+    manager = _new_manager(gateway)
+    create = asyncio.create_task(manager.create_session("session-cancelled"))
+    await gateway.create_started.wait()
+    create.cancel()
+    gateway.release_create.set()
+    with pytest.raises(asyncio.CancelledError):
+        await create
+
+    assert manager._session_to_gateway_index == {"session-cancelled": 0}
+    assert manager.active_sessions_per_gateway == [1]
+    gateway.abort_error = None
+    await manager.abort_session("session-cancelled")
+    assert gateway.abort_calls == ["session-cancelled"] * 2
+    assert manager.active_sessions_per_gateway == [0]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_gateway_manager_repeated_cancellation_still_settles_remote_create():
+    gateway = _SlowCreateGateway()
+    manager = _new_manager(gateway)
+    create = asyncio.create_task(manager.create_session("session-cancelled"))
+    await gateway.create_started.wait()
+    for _ in range(3):
+        create.cancel()
+        await asyncio.sleep(0)
+    still_waiting = not create.done()
+    gateway.release_create.set()
+    with pytest.raises(asyncio.CancelledError):
+        await create
+    await asyncio.wait_for(gateway.create_finished.wait(), timeout=1)
+
+    assert still_waiting
+    assert gateway.abort_calls == ["session-cancelled"]
+    assert manager._session_to_gateway_index == {}
+    assert manager.active_sessions_per_gateway == [0]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 async def test_gateway_manager_close_failure_retains_mapping_and_owner():
     close_error = RuntimeError("actor-close-unknown")
     gateway = _LifecycleGateway(finalize_error=close_error)

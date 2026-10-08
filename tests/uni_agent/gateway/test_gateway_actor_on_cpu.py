@@ -1848,3 +1848,53 @@ async def test_gateway_actor_drops_session_when_bind_route_fails(route_actor):
     backend.bind_route.return_value = None
     await actor.create_session("route-session")
     assert "route-session" in actor._sessions
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_gateway_actor_bind_error_survives_cancelled_route_release(route_actor):
+    from unittest.mock import AsyncMock
+
+    backend = _RouteBackend(release_error=asyncio.CancelledError())
+    backend.bind_route = AsyncMock(side_effect=RuntimeError("bind failed"))
+    actor = route_actor(backend)
+    with pytest.raises(RuntimeError, match="bind failed"):
+        await actor.create_session("route-session")
+    assert "route-session" not in actor._sessions
+    assert backend.release_calls == [{"session_id": "route-session"}]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_gateway_actor_repeated_cancellation_settles_route_release(route_actor):
+    from uni_agent.gateway.session.types import SessionFinalizedReleaseError
+
+    class _SlowReleaseBackend(_RouteBackend):
+        def __init__(self):
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+            self.release_finished = False
+
+        async def release_route(self, **kwargs):
+            self.release_started.set()
+            await self.allow_release.wait()
+            self.release_finished = True
+
+    backend = _SlowReleaseBackend()
+    actor = route_actor(backend)
+    await actor.create_session("route-session")
+    finalize = asyncio.create_task(actor.finalize_session("route-session"))
+    await backend.release_started.wait()
+    for _ in range(3):
+        finalize.cancel()
+        await asyncio.sleep(0)
+    still_waiting = not finalize.done()
+    backend.allow_release.set()
+    with pytest.raises(SessionFinalizedReleaseError) as raised:
+        await finalize
+    assert raised.value.trajectories == []
+    assert still_waiting
+    assert backend.release_finished

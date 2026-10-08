@@ -440,7 +440,10 @@ retries after the actor session has already been removed. Backends without these
 hooks retain their existing behavior.
 
 Cancelling session creation waits for the remote creation result and aborts any
-session it created. If finalization succeeds but route release fails, Manager
+session it created, even when cancellation repeats during cleanup. If abort
+fails before actor session removal, Manager keeps the route available for a
+retry. Failed-bind cleanup preserves the original binding error, including when
+route release is cancelled. If finalization succeeds but route release fails, Manager
 retries release once and preserves the finalized trajectories. Other finalize
 failures retain the routing entry for an explicit abort. Cleanup errors do not
 replace the original runner exception.
