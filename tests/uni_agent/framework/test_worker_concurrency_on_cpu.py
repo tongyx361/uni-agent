@@ -87,7 +87,11 @@ def test_ray_admission_rpc_keeps_rollouts_alive_and_backpressures_next_batch():
         ray.init(address="local", num_cpus=1, include_dashboard=False)
     worker = None
     try:
-        worker = ray.remote(ControlledWorker).remote((sys.executable, entry.__file__, verl.__file__))
+        # Keep production concurrency groups when the controlled test subclass
+        # inherits worker methods such as the independent efficiency snapshot.
+        worker = ray.remote(**entry.AgentFrameworkWorker._default_options)(ControlledWorker).remote(
+            (sys.executable, entry.__file__, verl.__file__)
+        )
         assert ray.get(worker.submit_sessions.remote(prompts("first")), timeout=30) is None
         assert ray.get(worker.read_state.remote(), timeout=10) == (["first"], [], 1)
 

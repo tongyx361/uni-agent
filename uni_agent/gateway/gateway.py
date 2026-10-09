@@ -37,6 +37,7 @@ from uni_agent.gateway.session import (
     SessionRouteReleaseError,
     Trajectory,
 )
+from uni_agent.gateway.session.session import GenerationMetrics
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.utils import run_uvicorn
 
@@ -82,6 +83,7 @@ class _GatewayActor:
             config.allowed_request_sampling_param_keys or ()
         )
         self._warned_discarded_request_sampling_param_keys: set[str] = set()
+        self._generation_metrics = GenerationMetrics()
         self._prompt_length = config.prompt_length
         self._response_length = config.response_length
         self._enable_last_assistant_rollback = config.enable_last_assistant_rollback
@@ -287,6 +289,7 @@ class _GatewayActor:
             # stamp the version the server currently serves, which lags the batch
             # step in verl v1 trainers, so enforcing it would reject every request.
             weight_version=weight_version if bind_route is not None else None,
+            generation_metrics=self._generation_metrics,
         )
         if bind_route is not None:
             try:
@@ -360,6 +363,10 @@ class _GatewayActor:
         release_task.result()
         if cancelled:
             raise asyncio.CancelledError()
+
+    async def get_efficiency_metrics(self) -> dict[str, int | float]:
+        """Return cumulative backend counters, including currently waiting calls."""
+        return self._generation_metrics.snapshot()
 
     async def get_session_state(self, session_id: str) -> dict[str, Any]:
         """Return a snapshot of a live session's state."""

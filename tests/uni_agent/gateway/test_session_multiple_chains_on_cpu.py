@@ -2229,3 +2229,101 @@ async def test_versioned_sibling_chains_share_session_route_and_version():
         (trajectory.extra_fields["min_global_steps"], trajectory.extra_fields["max_global_steps"])
         for trajectory in trajectories
     } == {(3, 3)}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_backend_efficiency_metrics_include_waiting_failure_and_cancellation(monkeypatch):
+    from uni_agent.gateway.session.session import GenerationMetrics
+
+    clock = [100.0]
+    monkeypatch.setattr("uni_agent.gateway.session.session.time.perf_counter", lambda: clock[0])
+    metrics = GenerationMetrics()
+
+    class Backend:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.error = None
+
+        async def generate(self, **kwargs):
+            self.entered.set()
+            await self.release.wait()
+            if self.error:
+                raise self.error
+            return TokenOutput(token_ids=_ids("ok"), log_probs=None, stop_reason="stop")
+
+    session = _session("efficiency")
+    session._generation_metrics = metrics
+    backend = Backend()
+    task = asyncio.create_task(_run(session, backend, [HELPFUL_SYS, {"role": "user", "content": "hi"}]))
+    await backend.entered.wait()
+    clock[0] = 103.0
+    snapshot = metrics.snapshot()
+    assert snapshot["model/requests_in_flight"] == 1
+    assert snapshot["model/request_elapsed_s"] == 3.0
+    assert snapshot["model/output_tokens"] == 0
+    backend.release.set()
+    result = await task
+    assert metrics.completed == 1
+    assert metrics.input_tokens == result.prompt_tokens
+    assert metrics.output_tokens == 2
+    assert metrics.snapshot()["model/request_elapsed_s"] == 3.0
+
+    for cancel in [False, True]:
+        failed_session = _session(f"failure-{cancel}")
+        failed_session._generation_metrics = metrics
+        backend = Backend()
+        backend.error = RuntimeError("backend failed")
+        task = asyncio.create_task(_run(failed_session, backend, [HELPFUL_SYS]))
+        await backend.entered.wait()
+        clock[0] += 2.0
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            backend.release.set()
+            with pytest.raises(HTTPException):
+                await task
+    snapshot = metrics.snapshot()
+    assert snapshot["model/requests_started"] == 3
+    assert snapshot["model/requests_failed"] == 1
+    assert snapshot["model/requests_cancelled"] == 1
+    assert snapshot["model/requests_in_flight"] == 0
+    assert snapshot["model/request_elapsed_s"] == 7.0
+    # Failed/cancelled calls count toward total elapsed, not completed elapsed.
+    assert snapshot["model/request_completed_elapsed_s"] == 3.0
+    assert snapshot["model/output_tokens"] == 2
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returned_version", [(None, None), (4, 4), (3, 4)])
+async def test_version_rejection_settles_metrics_without_counting_or_committing_output(returned_version):
+    from uni_agent.gateway.session.session import GenerationMetrics
+
+    metrics = GenerationMetrics()
+    session = GatewaySession(
+        SessionHandle(session_id="session-version-metrics"),
+        MessageCodec(FakeTokenizer()),
+        weight_version=3,
+        generation_metrics=metrics,
+    )
+    messages = [{"role": "user", "content": "base"}]
+    with pytest.raises(RuntimeError, match="backend generation version conflicts"):
+        await _run(session, _VersionedBackend([("REJECTED", *returned_version)]), messages)
+    rejected = metrics.snapshot()
+    assert rejected["model/requests_started"] == rejected["model/requests_failed"] == 1
+    assert rejected["model/requests_completed"] == rejected["model/requests_in_flight"] == 0
+    assert rejected["model/input_tokens"] == rejected["model/output_tokens"] == 0
+
+    await _run(session, _VersionedBackend([("ACCEPTED", 3, 3)]), messages)
+    [trajectory] = await session.finalize()
+    assert _decode_response_ids(trajectory.response_ids) == "ACCEPTED"
+    accepted = metrics.snapshot()
+    assert accepted["model/requests_started"] == 2
+    assert accepted["model/requests_failed"] == accepted["model/requests_completed"] == 1
+    assert accepted["model/requests_in_flight"] == 0

@@ -532,3 +532,29 @@ async def test_gateway_manager_abort_drops_route_when_only_release_fails():
     assert raised.value is release_error
     assert manager._session_to_gateway_index == {}
     assert manager.active_sessions_per_gateway == [0]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_efficiency_metrics_pool_counters_and_fail_on_missing_actor():
+    from types import SimpleNamespace
+
+    from uni_agent.gateway.manager import GatewayManager
+
+    async def snapshot():
+        return {"model/output_tokens": 9, "model/requests_in_flight": 2}
+
+    async def failed_snapshot():
+        raise RuntimeError("actor unavailable")
+
+    manager = GatewayManager.__new__(GatewayManager)
+    manager.gateways = [SimpleNamespace(get_efficiency_metrics=_FakeRemoteMethod(snapshot)) for _ in range(2)]
+    metrics = await manager.get_efficiency_metrics()
+    assert metrics["model/output_tokens"] == 18
+    assert metrics["model/requests_in_flight"] == 4
+    assert metrics["model/gateway_count"] == 2
+    assert metrics["model/snapshot_unix_s"] > 0
+    manager.gateways.append(SimpleNamespace(get_efficiency_metrics=_FakeRemoteMethod(failed_snapshot)))
+    with pytest.raises(RuntimeError, match="actor unavailable"):
+        await manager.get_efficiency_metrics()
