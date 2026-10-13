@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -25,6 +26,24 @@ _TRAJECTORY_CAPACITY_HINT = (
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS alone will not help. Check the rollout prompt_length/response_length "
     "budget or compact context earlier; the episode may be unfinished."
 )
+
+
+async def _wait_until_done(
+    task: asyncio.Task[Any], *, on_cancel: Callable[[], None] | None = None
+) -> asyncio.CancelledError | None:
+    """Wait through caller cancellation; the caller must retrieve the task's outcome."""
+    cancellation = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if not task.cancelled():
+                cancellation = cancellation or exc
+            if on_cancel is not None:
+                on_cancel()
+        except Exception:
+            pass  # The caller handles the completed task's result or exception.
+    return cancellation
 
 
 class SessionPhase(str, Enum):
@@ -258,19 +277,8 @@ class GatewaySession:
         # task covers preparation, backend generation, commit and cleanup.
         task = asyncio.create_task(self._run_generation(request, backend))
         self._generation_tasks[task] = False
-        cancellation: asyncio.CancelledError | None = None
         try:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError as exc:
-                    if not task.cancelled():
-                        cancellation = cancellation or exc
-                    if not task.done():
-                        self._cancel_generation_task(task)
-                except Exception:
-                    if cancellation is None:
-                        raise
+            cancellation = await _wait_until_done(task, on_cancel=lambda: self._cancel_generation_task(task))
             if cancellation is not None:
                 if not task.cancelled():
                     task.exception()
@@ -564,12 +572,7 @@ class GatewaySession:
 
         # Do not hold request_lock: generation cleanup needs it to release chain
         # reservations. Shield the shared task through repeated cancellation.
-        cancellation: asyncio.CancelledError | None = None
-        while not abort_task.done():
-            try:
-                await asyncio.shield(abort_task)
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
+        cancellation = await _wait_until_done(abort_task)
         abort_task.result()
         if cancellation is not None:
             raise cancellation
