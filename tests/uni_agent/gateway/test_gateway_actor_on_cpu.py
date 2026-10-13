@@ -12,6 +12,7 @@ import pytest
 import ray
 
 from tests.uni_agent.support import (
+    CancellationGatedBackend,
     FailingBackend,
     FakeProcessor,
     FakeTokenizer,
@@ -26,6 +27,55 @@ from tests.uni_agent.support import (
 )
 
 ALLOWED_SAMPLING_KEYS = frozenset({"temperature", "top_p", "top_k", "max_tokens", "stop"})
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_abort", [False, True])
+async def test_gateway_abort_keeps_session_owned_until_generation_cleanup_finishes(cancel_abort):
+    """The actor must settle generation before removing its session owner."""
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    backend = CancellationGatedBackend()
+    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
+    actor._server_base_url = "http://test"
+    await actor.create_session("abort-http")
+    generation = asyncio.create_task(
+        actor._handle_openai_chat_completions("abort-http", {"messages": [{"role": "user", "content": "hello"}]})
+    )
+    abort = None
+    try:
+        await asyncio.wait_for(backend.entered.wait(), timeout=5)
+        abort = asyncio.create_task(actor.abort_session("abort-http"))
+        await asyncio.wait_for(backend.cleanup_started.wait(), timeout=5)
+        assert "abort-http" in actor._sessions
+        assert not abort.done()
+        if cancel_abort:
+            for _ in range(2):
+                abort.cancel()
+                await asyncio.sleep(0)
+            assert "abort-http" in actor._sessions
+            assert not abort.done()
+        backend.release_cleanup.set()
+        if cancel_abort:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(abort, timeout=5)
+        else:
+            await asyncio.wait_for(abort, timeout=5)
+        assert backend.cleanup_finished.is_set()
+        assert generation.done()
+        assert "abort-http" not in actor._sessions
+        with pytest.raises(asyncio.CancelledError):
+            await generation
+        await actor.abort_session("abort-http")
+    finally:
+        backend.release_cleanup.set()
+        generation.cancel()
+        await asyncio.gather(generation, return_exceptions=True)
+        if abort is not None:
+            await asyncio.gather(abort, return_exceptions=True)
 
 
 async def fake_tool_call_dispatch(self, response_ids, tools, parser_name):
