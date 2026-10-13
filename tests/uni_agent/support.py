@@ -454,24 +454,3 @@ class RecordingConcurrentBackend:
         finally:
             finished_at = asyncio.get_running_loop().time()
             self.call_windows.append((request_id, started_at, finished_at))
-
-
-class CancellationGatedBackend:
-    """Keep cancelled backend cleanup pending until the test releases it."""
-
-    def __init__(self):
-        self.entered = asyncio.Event()
-        self.cleanup_started = asyncio.Event()
-        self.release_cleanup = asyncio.Event()
-        self.cleanup_finished = asyncio.Event()
-        self.calls = 0
-
-    async def generate(self, **kwargs):
-        self.calls += 1
-        self.entered.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            self.cleanup_started.set()
-            await self.release_cleanup.wait()
-            self.cleanup_finished.set()
