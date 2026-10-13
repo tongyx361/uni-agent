@@ -7,7 +7,7 @@ import httpx
 import pytest
 import ray
 
-from tests.uni_agent.support import FakeTokenizer, RecordingLLMClient, SequencedBackend
+from tests.uni_agent.support import CancellationGatedRouteBackend, FakeTokenizer, RecordingLLMClient, SequencedBackend
 
 
 @pytest.fixture(scope="session")
@@ -369,6 +369,62 @@ class _DetachedRemoteMethod:
 
     def remote(self, *args, **kwargs):
         return asyncio.shield(asyncio.ensure_future(self._fn(*args, **kwargs)))
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_gateway_manager_cancelled_abort_waits_for_actor_and_route_cleanup():
+    from types import SimpleNamespace
+
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    backend = CancellationGatedRouteBackend()
+    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
+    actor._server_base_url = "http://test"
+    await actor.create_session("cancelled-abort", weight_version=3)
+    gateway = SimpleNamespace(abort_session=_DetachedRemoteMethod(actor.abort_session))
+    manager = _new_manager(gateway, session_ids=("cancelled-abort",))
+    generation = asyncio.create_task(
+        actor._handle_openai_chat_completions("cancelled-abort", {"messages": [{"role": "user", "content": "hello"}]})
+    )
+    abort = None
+    try:
+        await asyncio.wait_for(backend.entered.wait(), timeout=5)
+        abort = asyncio.create_task(manager.abort_session("cancelled-abort"))
+        await asyncio.wait_for(backend.cleanup_started.wait(), timeout=5)
+        for _ in range(2):
+            abort.cancel()
+            await asyncio.sleep(0)
+        assert not abort.done()
+        assert manager.active_sessions_per_gateway == [1]
+        assert "cancelled-abort" in actor._sessions
+        assert backend.release_calls == []
+        backend.release_cleanup.set()
+        await asyncio.wait_for(backend.route_release_started.wait(), timeout=5)
+        for _ in range(2):
+            abort.cancel()
+            await asyncio.sleep(0)
+        assert not abort.done()
+        assert manager.active_sessions_per_gateway == [1]
+        backend.allow_route_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(abort, timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+            await generation
+        assert backend.route_release_finished.is_set()
+        assert backend.release_calls == [{"session_id": "cancelled-abort"}]
+        assert manager.active_sessions_per_gateway == [0]
+        assert manager._session_to_gateway_index == {}
+        assert "cancelled-abort" not in actor._sessions
+    finally:
+        backend.release_cleanup.set()
+        backend.allow_route_release.set()
+        generation.cancel()
+        await asyncio.gather(generation, return_exceptions=True)
+        if abort is not None:
+            await asyncio.gather(abort, return_exceptions=True)
 
 
 class _SlowCreateGateway(_LifecycleGateway):

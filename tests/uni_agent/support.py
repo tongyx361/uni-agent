@@ -454,3 +454,47 @@ class RecordingConcurrentBackend:
         finally:
             finished_at = asyncio.get_running_loop().time()
             self.call_windows.append((request_id, started_at, finished_at))
+
+
+class CancellationGatedBackend:
+    """Keep cancelled backend cleanup pending until the test releases it."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+        self.release_cleanup = asyncio.Event()
+        self.cleanup_finished = asyncio.Event()
+        self.calls = 0
+
+    async def generate(self, **kwargs):
+        self.calls += 1
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cleanup_started.set()
+            await self.release_cleanup.wait()
+            self.cleanup_finished.set()
+
+
+class CancellationGatedRouteBackend(CancellationGatedBackend):
+    """Check generation settlement before allowing terminal route release."""
+
+    def __init__(self):
+        super().__init__()
+        self.bind_calls = []
+        self.release_calls = []
+        self.route_release_started = asyncio.Event()
+        self.allow_route_release = asyncio.Event()
+        self.route_release_finished = asyncio.Event()
+
+    async def bind_route(self, **kwargs):
+        self.bind_calls.append(kwargs)
+        return kwargs.get("weight_version")
+
+    async def release_route(self, **kwargs):
+        assert self.cleanup_finished.is_set()
+        self.release_calls.append(kwargs)
+        self.route_release_started.set()
+        await self.allow_route_release.wait()
+        self.route_release_finished.set()

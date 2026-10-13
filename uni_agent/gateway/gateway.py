@@ -333,8 +333,14 @@ class _GatewayActor:
     async def abort_session(self, session_id: str) -> None:
         """Abort a live session and remove its route even if the session is already gone."""
         session = self._sessions.get(session_id)
+        cancellation: asyncio.CancelledError | None = None
         if session is not None:
-            await session.abort()
+            try:
+                await session.abort()
+            except asyncio.CancelledError as exc:
+                # Session.abort settles generation before surfacing cancellation.
+                # Finish the actor's route release before propagating it too.
+                cancellation = exc
         try:
             await self._remove_session(session_id)
         except BaseException as exc:
@@ -342,6 +348,8 @@ class _GatewayActor:
             # failure so the manager still frees its routing slot. Retry abort
             # to release the route again.
             raise SessionRouteReleaseError() from exc
+        if cancellation is not None:
+            raise cancellation
 
     async def _remove_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
@@ -354,15 +362,15 @@ class _GatewayActor:
         # ensure_future, not create_task: backends such as Laminar's
         # LLMServerClient return a Ray ObjectRef, which is awaitable but not a coroutine.
         release_task = asyncio.ensure_future(release_route(session_id=session_id))
-        cancelled = False
+        cancellation: asyncio.CancelledError | None = None
         while not release_task.done():
             try:
                 await asyncio.shield(release_task)
-            except asyncio.CancelledError:
-                cancelled = True
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
         release_task.result()
-        if cancelled:
-            raise asyncio.CancelledError()
+        if cancellation is not None:
+            raise cancellation
 
     async def get_efficiency_metrics(self) -> dict[str, int | float]:
         """Return cumulative backend counters, including currently waiting calls."""

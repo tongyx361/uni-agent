@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from tests.uni_agent.support import (
+    CancellationGatedBackend,
     FakeProcessor,
     FakeTokenizer,
     SequencedBackend,
@@ -106,6 +107,14 @@ async def _run(session: GatewaySession, backend: SequencedBackend, messages: lis
         allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
     )
     return await session.run_generation(request, backend)
+
+
+async def _wait_for(predicate):
+    async def wait():
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout=5)
 
 
 class _LogprobBackend:
@@ -960,7 +969,7 @@ async def test_exact_retry_reuses_inflight_generation(chain_path, caplog):
     await backend.wait_for_calls(1)
     duplicate = asyncio.create_task(_run(session, backend, continuation))
     second_duplicate = asyncio.create_task(_run(session, backend, continuation))
-    await asyncio.sleep(0)
+    await _wait_for(lambda: session.snapshot_state()["num_coalesced_requests"] == 2)
 
     assert len(backend.calls) == 1
     assert session.snapshot_state()["num_coalesced_requests"] == 2
@@ -1725,14 +1734,166 @@ async def test_multiple_chains_terminal_state_rejects_late_commit(terminal_actio
     if terminal_action == "finalize":
         terminal_result = await session.finalize()
         assert [_decode_response_ids(trajectory.response_ids) for trajectory in terminal_result] == ["FIRST"]
+        pending_backend.release_call(0)
+        with pytest.raises(HTTPException) as exc_info:
+            await pending_task
+        assert exc_info.value.status_code == 409
     else:
         await session.abort()
-
-    pending_backend.release_call(0)
-    with pytest.raises(HTTPException) as exc_info:
-        await pending_task
-    assert exc_info.value.status_code == 409
+        with pytest.raises(asyncio.CancelledError):
+            await pending_task
     assert session.snapshot_state()["active_chain_ids"] == []
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_abort", [False, True])
+@pytest.mark.parametrize("coalesce", [False, True])
+async def test_abort_waits_for_generation_cleanup_and_repeated_callers(cancel_abort, coalesce):
+    """Close admission and settle all owners/waiters before abort completes."""
+    session = _session("abort-inflight", coalesce_reserved_exact_requests=coalesce)
+    backend = CancellationGatedBackend()
+    prompt = [{"role": "user", "content": "first turn"}]
+    owner = asyncio.create_task(_run(session, backend, prompt))
+    await asyncio.wait_for(backend.entered.wait(), timeout=5)
+    other = asyncio.create_task(_run(session, backend, prompt))
+    abort = repeated_abort = None
+    try:
+        if coalesce:
+            await _wait_for(lambda: session.snapshot_state()["num_coalesced_requests"] == 1)
+        else:
+            await _wait_for(lambda: backend.calls == 2)
+        assert backend.calls == (1 if coalesce else 2)
+        abort = asyncio.create_task(session.abort())
+        await asyncio.wait_for(backend.cleanup_started.wait(), timeout=5)
+        repeated_abort = asyncio.create_task(session.abort())
+        await asyncio.sleep(0)
+        assert not abort.done()
+        assert not repeated_abort.done()
+        assert not backend.cleanup_finished.is_set()
+        unused_backend = SequencedBackend(["SHOULD_NOT_RUN"])
+        with pytest.raises(HTTPException) as exc_info:
+            await _run(session, unused_backend, prompt)
+        assert exc_info.value.status_code == 409
+        assert unused_backend.calls == []
+        if cancel_abort:
+            for _ in range(2):
+                abort.cancel()
+                await asyncio.sleep(0)
+            assert not abort.done()
+            assert not backend.cleanup_finished.is_set()
+        backend.release_cleanup.set()
+        abort_results = await asyncio.wait_for(asyncio.gather(abort, repeated_abort, return_exceptions=True), timeout=5)
+        assert isinstance(abort_results[0], asyncio.CancelledError) if cancel_abort else abort_results[0] is None
+        assert abort_results[1] is None
+        results = await asyncio.gather(owner, other, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert backend.cleanup_finished.is_set()
+        assert session._inflight_exact_requests == {}
+        assert session.reserved_chain_ids == set()
+        assert session._generation_tasks == {}
+        await session.abort()
+    finally:
+        backend.release_cleanup.set()
+        for task in (owner, other):
+            task.cancel()
+        await asyncio.gather(owner, other, return_exceptions=True)
+        await asyncio.gather(*[task for task in (abort, repeated_abort) if task is not None], return_exceptions=True)
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_abort_cancels_preparation_while_it_holds_request_lock(monkeypatch):
+    """A stalled async codec operation must not prevent terminal cancellation."""
+    session = _session("abort-prepare")
+    prepare_started = asyncio.Event()
+    prepare_cancelled = asyncio.Event()
+
+    async def stalled_prepare(request):
+        prepare_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            prepare_cancelled.set()
+
+    monkeypatch.setattr(session, "_prepare_generation_inputs", stalled_prepare)
+    backend = SequencedBackend(["SHOULD_NOT_RUN"])
+    generation = asyncio.create_task(_run(session, backend, [{"role": "user", "content": "first turn"}]))
+    try:
+        await asyncio.wait_for(prepare_started.wait(), timeout=5)
+        await asyncio.wait_for(session.abort(), timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+            await generation
+        assert prepare_cancelled.is_set()
+        assert backend.calls == []
+        assert not session.request_lock.locked()
+        assert session._generation_tasks == {}
+        assert session.phase.value == "ABORTED"
+    finally:
+        generation.cancel()
+        await asyncio.gather(generation, return_exceptions=True)
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_abort_joins_already_cancelled_generation_without_interrupting_backend_cleanup():
+    """A later abort must not inject a second cancellation into backend finally."""
+    session = _session("abort-already-cancelled")
+    backend = CancellationGatedBackend()
+    generation = asyncio.create_task(_run(session, backend, [{"role": "user", "content": "hello"}]))
+    abort = repeated_abort = None
+    try:
+        await asyncio.wait_for(backend.entered.wait(), timeout=5)
+        generation.cancel()
+        await asyncio.wait_for(backend.cleanup_started.wait(), timeout=5)
+        abort = asyncio.create_task(session.abort())
+        repeated_abort = asyncio.create_task(session.abort())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not generation.done()
+        assert not abort.done()
+        assert not repeated_abort.done()
+        assert not backend.cleanup_finished.is_set()
+        backend.release_cleanup.set()
+        await asyncio.wait_for(asyncio.gather(abort, repeated_abort), timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+            await generation
+        assert backend.cleanup_finished.is_set()
+        assert session._generation_tasks == {}
+    finally:
+        backend.release_cleanup.set()
+        generation.cancel()
+        await asyncio.gather(generation, return_exceptions=True)
+        await asyncio.gather(*[task for task in (abort, repeated_abort) if task is not None], return_exceptions=True)
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_failure", [False, True])
+async def test_completed_generation_does_not_hide_caller_cancellation(backend_failure):
+    """Honor cancellation between core completion and the caller resuming."""
+    session = _session("cancel-completed-core")
+    backend = _ControlledParallelBackend([RuntimeError("backend failed") if backend_failure else "COMPLETED"])
+    generation = asyncio.create_task(_run(session, backend, [{"role": "user", "content": "hello"}]))
+    await backend.wait_for_calls(1)
+    [core] = session._generation_tasks
+    core.add_done_callback(lambda _: generation.cancel())
+    backend.release_call(0)
+    with pytest.raises(asyncio.CancelledError):
+        await generation
+    assert core.done() and not core.cancelled()
+    assert session._generation_tasks == {}
+    if backend_failure:
+        assert isinstance(core.exception(), HTTPException)
+        assert await session.finalize() == []
+    else:
+        assert core.exception() is None
+        [trajectory] = await session.finalize()
+        assert _decode_response_ids(trajectory.response_ids) == "COMPLETED"
 
 
 @pytest.mark.cpu

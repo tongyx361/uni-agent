@@ -194,13 +194,25 @@ class GatewayManager:
         routing entry so the caller can retry.
         """
         gateway, gateway_index = self._get_gateway(session_id)
+        cancellation: asyncio.CancelledError | None = None
         try:
-            await gateway.abort_session.remote(session_id=session_id)
+            abort_task = asyncio.ensure_future(gateway.abort_session.remote(session_id=session_id))
+            # Cancelling this await does not cancel the actor RPC. Wait for its
+            # outcome before dropping (or retaining) the manager's owner slot.
+            while not abort_task.done():
+                try:
+                    await asyncio.shield(abort_task)
+                except asyncio.CancelledError as exc:
+                    if not abort_task.cancelled():
+                        cancellation = cancellation or exc
+            abort_task.result()
         except BaseException as exc:
             if _find_in_cause_chain(exc, SessionRouteReleaseError) is not None:
                 self._drop_route(session_id, gateway_index)
             raise
         self._drop_route(session_id, gateway_index)
+        if cancellation is not None:
+            raise cancellation
 
     def _drop_route(self, session_id: str, gateway_index: int) -> None:
         # Idempotent: decrement only when this call removed the entry, so a
