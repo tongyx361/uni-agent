@@ -284,12 +284,15 @@ class _GatewayActor:
             bind_route = getattr(self._backend, "bind_route", None)
             if bind_route is not None:
                 await bind_route(session_id=session_id, weight_version=weight_version)
+            if self._sessions.get(session_id) is not session or session.phase != SessionPhase.ACTIVE:
+                raise RuntimeError(f"Session {session_id} closed during route binding")
         except BaseException:
-            cleanup, _ = await _settle_call(self.abort_session(session_id, creation_id=creation_id))
-            try:
-                cleanup.result()
-            except (Exception, asyncio.CancelledError):
-                logger.exception("session %s: cleanup failed after route bind failure", session_id)
+            if self._sessions.get(session_id) is session:
+                cleanup, _ = await _settle_call(self.abort_session(session_id, creation_id=creation_id))
+                try:
+                    cleanup.result()
+                except (Exception, asyncio.CancelledError):
+                    logger.exception("session %s: cleanup failed after route bind failure", session_id)
             raise
         return handle
 

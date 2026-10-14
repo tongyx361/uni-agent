@@ -894,6 +894,51 @@ async def test_delayed_actor_cleanup_cannot_close_replacement_with_same_session_
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+@pytest.mark.parametrize("creation_id", ["original", None], ids=["manager-nonce", "direct-legacy"])
+@pytest.mark.parametrize("terminal", ["finalized", "removed", "replaced"])
+async def test_actor_rejects_late_bind_result_after_its_session_closes(creation_id, terminal):
+    from uni_agent.gateway.session.session import SessionPhase
+
+    class _LateBindClient(_RouteClient):
+        def bind_route(self, **kwargs):
+            async def bind():
+                self.bind_calls.append(kwargs)
+                if kwargs["weight_version"] == 3:
+                    self.bind_started.set()
+                    await self.allow_bind.wait()
+
+            return asyncio.ensure_future(bind())
+
+    backend = _LateBindClient()
+    backend.allow_bind.clear()
+    gateway = _RouteGateway()
+    gateway.actor._backend = backend
+    creating = asyncio.create_task(gateway.actor.create_session("reused", weight_version=3, creation_id=creation_id))
+    await asyncio.wait_for(backend.bind_started.wait(), 2)
+    if terminal == "finalized":
+        await gateway.actor.finalize_session("reused", creation_id=creation_id, close=False)
+    else:
+        await gateway.actor.abort_session("reused", creation_id=creation_id)
+    replacement = None
+    if terminal == "replaced":
+        await gateway.actor.create_session("reused", weight_version=4, creation_id="replacement")
+        replacement = gateway.actor._sessions["reused"]
+
+    backend.allow_bind.set()
+    with pytest.raises(RuntimeError, match="closed during route binding"):
+        await asyncio.wait_for(creating, 2)
+    assert backend.release_calls == [{"session_id": "reused"}]
+    if replacement is None:
+        assert gateway.actor._sessions == {}
+    else:
+        assert gateway.actor._sessions["reused"] is replacement
+        assert replacement.phase == SessionPhase.ACTIVE
+        await gateway.actor.abort_session("reused", creation_id="replacement")
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 @pytest.mark.parametrize("concurrent_abort", [False, True])
 async def test_actor_release_settles_repeated_cancellation_and_concurrent_close(concurrent_abort):
     backend = _RouteClient()
