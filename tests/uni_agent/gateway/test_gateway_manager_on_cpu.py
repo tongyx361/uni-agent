@@ -337,19 +337,23 @@ class _LifecycleGateway:
         self.abort_calls = []
         self.finalize_calls = []
 
-    async def _abort(self, session_id):
+    async def _abort(self, session_id, **kwargs):
         self.abort_calls.append(session_id)
         if self.abort_error is not None:
             raise self.abort_error
 
-    async def _finalize(self, session_id):
+    async def _finalize(self, session_id, **kwargs):
         self.finalize_calls.append(session_id)
         if self.finalize_error is not None:
             raise self.finalize_error
         return ["trajectory"]
 
+    async def _close(self, session_id, **kwargs):
+        return None
+
     abort_session = property(lambda self: _FakeRemoteMethod(self._abort))
     finalize_session = property(lambda self: _FakeRemoteMethod(self._finalize))
+    close_session = property(lambda self: _FakeRemoteMethod(self._close))
 
 
 def _new_manager(gateway, *, session_ids=(), llm_client=None):
@@ -358,8 +362,11 @@ def _new_manager(gateway, *, session_ids=(), llm_client=None):
     manager = GatewayManager.__new__(GatewayManager)
     manager.gateways = [gateway]
     manager.active_sessions_per_gateway = [len(session_ids)]
-    manager._session_owners = {session_id: _SessionOwner(0, True) for session_id in session_ids}
-    manager._llm_client = llm_client or object()
+    manager._session_owners = {session_id: _SessionOwner(0) for session_id in session_ids}
+    if isinstance(gateway, _RouteGateway):
+        gateway.actor._backend = llm_client or object()
+        for session_id, owner in manager._session_owners.items():
+            gateway.seed_session(session_id, owner.creation_id)
     return manager
 
 
@@ -413,7 +420,7 @@ async def test_gateway_manager_cancelled_create_aborts_what_the_actor_created(cr
         await create
     await asyncio.wait_for(gateway.create_finished.wait(), timeout=1)
 
-    assert gateway.abort_calls == ([] if create_error else ["session-cancelled"])
+    assert gateway.abort_calls == ["session-cancelled"]
     assert manager._session_owners == {}
     assert manager.active_sessions_per_gateway == [0]
 
@@ -513,15 +520,37 @@ async def test_gateway_manager_rejects_duplicate_create_without_touching_owner()
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_awaitable", [False, True])
+async def test_gateway_manager_releases_reservation_after_synchronous_submission_failure(bad_awaitable):
+    class _SubmissionFailureGateway(_LifecycleGateway):
+        def _create(self, session_id, **kwargs):
+            if bad_awaitable:
+                return object()
+            raise TypeError("session arguments cannot be serialized")
+
+        create_session = property(lambda self: _FakeRemoteMethod(self._create))
+
+    gateway = _SubmissionFailureGateway()
+    manager = _new_manager(gateway)
+    with pytest.raises(TypeError):
+        await manager.create_session("failed")
+    assert manager._session_owners == {}
+    assert manager.active_sessions_per_gateway == [0]
+    assert gateway.abort_calls == ["failed"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 async def test_gateway_manager_concurrent_closes_release_load_slot_once():
     class _ConcurrentCloseGateway(_LifecycleGateway):
-        async def _finalize(self, session_id):
+        async def _finalize(self, session_id, **kwargs):
             await asyncio.sleep(0)
-            return await super()._finalize(session_id)
+            return await super()._finalize(session_id, **kwargs)
 
-        async def _abort(self, session_id):
+        async def _abort(self, session_id, **kwargs):
             await asyncio.sleep(0)
-            await super()._abort(session_id)
+            await super()._abort(session_id, **kwargs)
 
     gateway = _ConcurrentCloseGateway()
     manager = _new_manager(gateway, session_ids=("session-close",))
@@ -570,20 +599,52 @@ class _RouteClient:
 
 class _RouteGateway(_SlowCreateGateway):
     def __init__(self, **kwargs):
+        from uni_agent.gateway.config import GatewayActorConfig
+        from uni_agent.gateway.gateway import _GatewayActor
+
         super().__init__(**kwargs)
         self.create_kwargs = []
         self.release_create.set()
+        self.actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend=object())
+        self.actor._server_base_url = "http://gateway"
+
+    def seed_session(self, session_id, creation_id):
+        from uni_agent.gateway.session import GatewaySession, SessionHandle
+        from uni_agent.gateway.session.session import SessionPhase
+
+        session = GatewaySession(SessionHandle(session_id=session_id), self.actor._codec)
+        session._creation_id = creation_id
+        session.phase = SessionPhase.FINALIZED
+        self.actor._sessions[session_id] = session
 
     async def _create(self, session_id, **kwargs):
         self.create_kwargs.append(kwargs)
-        return await super()._create(session_id, **kwargs)
+        await super()._create(session_id, **kwargs)
+        return await self.actor.create_session(session_id, **kwargs)
+
+    async def _abort(self, session_id, **kwargs):
+        await super()._abort(session_id, **kwargs)
+        await self.actor.abort_session(session_id, **kwargs)
+
+    async def _finalize(self, session_id, **kwargs):
+        from uni_agent.gateway.session.session import SessionPhase
+
+        self.finalize_calls.append(session_id)
+        # Seeded manager tests model a successful finalize ACK, keeping its
+        # actor-side FINALIZED state for release retries.
+        if self.actor._get_session(session_id).phase != SessionPhase.FINALIZED:
+            await self.actor.finalize_session(session_id, **kwargs)
+        return ["trajectory"]
+
+    async def _close(self, session_id, **kwargs):
+        await self.actor.close_session(session_id, **kwargs)
 
 
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
 @pytest.mark.parametrize("requested,bound", [(3, 7), (3, None), (None, 7)])
-async def test_gateway_manager_passes_only_final_bound_version_to_actor(requested, bound):
+async def test_gateway_manager_passes_requested_version_to_actor_backend(requested, bound):
     backend = _RouteClient(bound)
     gateway = _RouteGateway()
     manager = _new_manager(gateway, llm_client=backend)
@@ -591,7 +652,8 @@ async def test_gateway_manager_passes_only_final_bound_version_to_actor(requeste
     assert backend.bind_calls == [{"session_id": "bound", "weight_version": requested}]
     assert gateway.create_kwargs == [
         {
-            "weight_version": bound if requested is not None else None,
+            "weight_version": requested,
+            "creation_id": manager._session_owners["bound"].creation_id,
             "metadata": {"owner": "runner"},
             "sampling_params": {},
         }
@@ -608,35 +670,31 @@ async def test_gateway_manager_plain_backend_does_not_pin_batch_version():
     gateway = _RouteGateway()
     manager = _new_manager(gateway)
     await manager.create_session("plain", weight_version=3)
-    assert gateway.create_kwargs == [{"weight_version": None}]
+    assert gateway.create_kwargs == [{"weight_version": 3, "creation_id": manager._session_owners["plain"].creation_id}]
     await manager.abort_session("plain")
 
 
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["bind", "actor", "stale-version", "invalid-version"])
+@pytest.mark.parametrize("stage", ["bind", "actor"])
 @pytest.mark.parametrize("release_fails", [False, True])
-async def test_gateway_manager_failed_create_keeps_original_error_and_releases_only_owned_route(stage, release_fails):
+async def test_gateway_manager_failed_create_keeps_original_error_and_retry_owner(stage, release_fails):
     original = RuntimeError("original create failure")
     backend = _RouteClient(
-        {"stale-version": 2, "invalid-version": True}.get(stage, 7),
         bind_error=original if stage == "bind" else None,
-        release_errors=[RuntimeError("cleanup failed")] if release_fails else [],
+        release_errors=[RuntimeError("cleanup failed")] * 2 if release_fails else [],
     )
     gateway = _RouteGateway(create_error=original if stage == "actor" else None)
     manager = _new_manager(gateway, llm_client=backend)
-    error_type = ValueError if stage.endswith("version") else RuntimeError
-    with pytest.raises(error_type) as raised:
+    with pytest.raises(RuntimeError) as raised:
         await manager.create_session("failed", weight_version=3)
-    if error_type is RuntimeError:
-        assert raised.value is original
-    assert backend.release_calls == [{"session_id": "failed"}]
-    assert gateway.abort_calls == []
-    if release_fails:
-        assert not manager._session_owners["failed"].actor_created
+    assert raised.value is original
+    expected_releases = [{"session_id": "failed"}] * (2 if release_fails else 1) if stage == "bind" else []
+    assert backend.release_calls == expected_releases
+    if release_fails and stage == "bind":
+        assert "failed" in manager._session_owners
         await manager.abort_session("failed")
-        assert gateway.abort_calls == []  # A failed actor create may refer to a pre-existing session.
     assert manager._session_owners == {}
     assert manager.active_sessions_per_gateway == [0]
 
@@ -654,10 +712,10 @@ async def test_gateway_manager_release_failure_keeps_finalized_trajectories_and_
     assert len(backend.release_calls) == 2
     assert gateway.abort_calls == []
     if failures == 2:
-        assert not manager._session_owners["finished"].actor_created
+        assert "finished" in gateway.actor._sessions
         assert manager.active_sessions_per_gateway == [1]
         await manager.abort_session("finished")
-        assert gateway.abort_calls == []
+        assert gateway.abort_calls == ["finished"]
     assert manager.active_sessions_per_gateway == [0]
     assert manager._session_owners == {}
 
@@ -716,14 +774,14 @@ async def test_gateway_manager_repeated_cancellation_settles_route_release_then_
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("requested", [-1, True, 1.5])
-async def test_gateway_manager_invalid_requested_version_has_no_lifecycle_side_effects(requested):
-    backend = _RouteClient()
+@pytest.mark.parametrize("bound", [2, True, "backend-specific"])
+async def test_gateway_ignores_backend_bind_result(bound):
+    backend = _RouteClient(bound)
     gateway = _RouteGateway()
     manager = _new_manager(gateway, llm_client=backend)
-    with pytest.raises(ValueError, match="non-negative integer"):
-        await manager.create_session("invalid", weight_version=requested)
-    assert backend.bind_calls == backend.release_calls == gateway.create_kwargs == []
+    await manager.create_session("opaque", weight_version=3)
+    await manager.abort_session("opaque")
+    assert backend.bind_calls == [{"session_id": "opaque", "weight_version": 3}]
     assert manager._session_owners == {}
     assert manager.active_sessions_per_gateway == [0]
 
@@ -733,12 +791,12 @@ async def test_gateway_manager_invalid_requested_version_has_no_lifecycle_side_e
 @pytest.mark.asyncio
 async def test_gateway_manager_bind_error_survives_cancelled_release():
     original = RuntimeError("bind failed")
-    backend = _RouteClient(bind_error=original, release_errors=[asyncio.CancelledError()])
+    backend = _RouteClient(bind_error=original, release_errors=[asyncio.CancelledError()] * 2)
     manager = _new_manager(_RouteGateway(), llm_client=backend)
     with pytest.raises(RuntimeError) as raised:
         await manager.create_session("failed", weight_version=3)
     assert raised.value is original
-    assert not manager._session_owners["failed"].actor_created
+    assert "failed" in manager._session_owners
     await manager.abort_session("failed")
     assert manager._session_owners == {}
 
@@ -760,7 +818,7 @@ async def test_gateway_manager_cancelled_finalize_propagates_even_when_release_f
     with pytest.raises(asyncio.CancelledError):
         await closing
     if failures == 2:
-        assert not manager._session_owners["closing"].actor_created
+        assert "closing" in manager._session_owners
         await manager.abort_session("closing")
     assert manager._session_owners == {}
     assert manager.active_sessions_per_gateway == [0]
@@ -773,10 +831,10 @@ async def test_gateway_manager_cancelled_finalize_settles_actor_before_route_rel
     started, finish = asyncio.Event(), asyncio.Event()
 
     class _SlowFinalizeGateway(_RouteGateway):
-        async def _finalize(self, session_id):
+        async def _finalize(self, session_id, **kwargs):
             started.set()
             await finish.wait()
-            return await super()._finalize(session_id)
+            return await super()._finalize(session_id, **kwargs)
 
     backend = _RouteClient()
     gateway = _SlowFinalizeGateway()
@@ -796,6 +854,155 @@ async def test_gateway_manager_cancelled_finalize_settles_actor_before_route_rel
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+async def test_failed_duplicate_actor_create_never_closes_preexisting_session():
+    backend = _RouteClient()
+    gateway = _RouteGateway()
+    manager = _new_manager(gateway, llm_client=backend)
+    await gateway.actor.create_session("duplicate", creation_id="original", weight_version=3)
+    original = gateway.actor._sessions["duplicate"]
+    with pytest.raises(RuntimeError, match="already exists"):
+        await manager.create_session("duplicate", weight_version=3)
+    assert gateway.actor._sessions["duplicate"] is original
+    assert backend.release_calls == []
+    assert manager._session_owners == {}
+    assert manager.active_sessions_per_gateway == [0]
+    await gateway.actor.abort_session("duplicate", creation_id="original")
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_delayed_actor_cleanup_cannot_close_replacement_with_same_session_id():
+    backend = _RouteClient()
+    gateway = _RouteGateway()
+    manager = _new_manager(gateway, llm_client=backend)
+    await manager.create_session("reused", weight_version=3)
+    old_creation = manager._session_owners["reused"].creation_id
+    await manager.finalize_session("reused")
+    await manager.create_session("reused", weight_version=4)
+    replacement = gateway.actor._sessions["reused"]
+    await gateway.actor.close_session("reused", creation_id=old_creation)
+    await gateway.actor.abort_session("reused", creation_id=old_creation)
+    with pytest.raises(KeyError, match="different creation"):
+        await gateway.actor.finalize_session("reused", creation_id=old_creation)
+    assert gateway.actor._sessions["reused"] is replacement
+    assert backend.release_calls == [{"session_id": "reused"}]
+    await manager.abort_session("reused")
+    assert manager.active_sessions_per_gateway == [0]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrent_abort", [False, True])
+async def test_actor_release_settles_repeated_cancellation_and_concurrent_close(concurrent_abort):
+    backend = _RouteClient()
+    gateway = _RouteGateway()
+    gateway.actor._backend = backend
+    await gateway.actor.create_session("closing", creation_id="one")
+    await gateway.actor.finalize_session("closing", creation_id="one", close=False)
+    backend.allow_release.clear()
+    close = asyncio.create_task(gateway.actor.close_session("closing", creation_id="one"))
+    await backend.release_started.wait()
+    other_close = (
+        asyncio.create_task(gateway.actor.abort_session("closing", creation_id="one")) if concurrent_abort else None
+    )
+    for _ in range(3):
+        close.cancel()
+        await asyncio.sleep(0)
+    assert not close.done()
+    backend.allow_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+    if other_close is not None:
+        await other_close
+    assert backend.release_calls == [{"session_id": "closing"}]
+    assert gateway.actor._sessions == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_actor_releases_after_session_abort_reports_deferred_cancellation():
+    from uni_agent.gateway.session.session import SessionPhase
+
+    backend = _RouteClient()
+    gateway = _RouteGateway()
+    gateway.actor._backend = backend
+    await gateway.actor.create_session("cancelled", creation_id="one")
+    session = gateway.actor._sessions["cancelled"]
+
+    async def abort():
+        session.phase = SessionPhase.ABORTED
+        raise asyncio.CancelledError
+
+    session.abort = abort
+    with pytest.raises(asyncio.CancelledError):
+        await gateway.actor.abort_session("cancelled", creation_id="one")
+    assert backend.release_calls == [{"session_id": "cancelled"}]
+    assert gateway.actor._sessions == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_manager_cancels_actor_bind_wait_without_waiting_for_readiness(ray_runtime):
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.manager import GatewayManager
+
+    @ray.remote
+    class _Calls:
+        def __init__(self):
+            self.binds = 0
+            self.releases = 0
+
+        def bound(self):
+            self.binds += 1
+
+        def released(self):
+            self.releases += 1
+
+        def counts(self):
+            return self.binds, self.releases
+
+    class _WaitingBackend:
+        def __init__(self, calls):
+            self.calls = calls
+
+        async def bind_route(self, **kwargs):
+            await self.calls.bound.remote()
+            await asyncio.Event().wait()
+
+        def release_route(self, **kwargs):
+            return self.calls.released.remote()
+
+    calls = _Calls.remote()
+    manager = GatewayManager(
+        _WaitingBackend(calls), gateway_count=1, gateway_actor_config=GatewayActorConfig(tokenizer=FakeTokenizer())
+    )
+    try:
+        creation = asyncio.create_task(manager.create_session("pending"))
+        async with asyncio.timeout(10):
+            while (await calls.counts.remote())[0] == 0:
+                await asyncio.sleep(0.01)
+        for _ in range(3):
+            creation.cancel()
+            await asyncio.sleep(0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(creation, timeout=10)
+        assert await calls.counts.remote() == (1, 1)
+        assert manager._session_owners == {}
+        assert manager.active_sessions_per_gateway == [0]
+        with pytest.raises(ray.exceptions.RayTaskError):
+            await manager.gateways[0].get_session_state.remote("pending")
+    finally:
+        await manager.shutdown()
+        ray.kill(calls)
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["pinned", "conflicting", "latest"])
 async def test_gateway_manager_route_authority_is_shared_across_ray_client_copies(ray_runtime, mode):
     from uni_agent.gateway.config import GatewayActorConfig
@@ -807,18 +1014,27 @@ async def test_gateway_manager_route_authority_is_shared_across_ray_client_copie
     class _SharedRoutingClient:
         def __init__(self, authority):
             self.authority = authority
+            self.bound_versions = {}
 
-        def bind_route(self, **kwargs):
-            return self.authority.bind.remote(**kwargs)
+        async def bind_route(self, **kwargs):
+            version = await self.authority.bind.remote(**kwargs)
+            self.bound_versions[kwargs["session_id"]] = version
+            return version
 
-        def release_route(self, **kwargs):
-            return self.authority.release.remote(**kwargs)
+        async def release_route(self, **kwargs):
+            await self.authority.release.remote(**kwargs)
+            self.bound_versions.pop(kwargs["session_id"], None)
 
         async def generate(
             self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None, **kwargs
         ):
             assert "weight_version" not in kwargs
-            return await self.authority.generate.remote(session_id=request_id)
+            assert request_id in self.bound_versions
+            output = await self.authority.generate.remote(session_id=request_id)
+            expected = self.bound_versions[request_id]
+            if expected is not None and output.extra_fields["min_global_steps"] != expected:
+                raise RuntimeError("backend generation version conflicts with bound route")
+            return output
 
     @ray.remote
     class _Authority:
@@ -849,8 +1065,9 @@ async def test_gateway_manager_route_authority_is_shared_across_ray_client_copie
             return list(self.routes)
 
     authority = _Authority.remote()
+    backend = _SharedRoutingClient(authority)
     manager = GatewayManager(
-        _SharedRoutingClient(authority),
+        backend,
         gateway_count=1,
         gateway_actor_config=GatewayActorConfig(tokenizer=FakeTokenizer()),
     )
@@ -872,6 +1089,7 @@ async def test_gateway_manager_route_authority_is_shared_across_ray_client_copie
                 assert trajectory.extra_fields["min_global_steps"] == 7
                 assert trajectory.extra_fields["max_global_steps"] == (8 if mode == "latest" else 7)
         assert await authority.remaining.remote() == []
+        assert backend.bound_versions == {}  # Driver copy never owns the actor's bindings.
         assert manager.active_sessions_per_gateway == [0]
     finally:
         await manager.shutdown()

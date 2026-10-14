@@ -2206,7 +2206,6 @@ async def test_versioned_sibling_chains_share_session_route_and_version():
     session = GatewaySession(
         SessionHandle(session_id="session-versioned-siblings"),
         MessageCodec(FakeTokenizer()),
-        weight_version=3,
     )
     backend = _VersionedBackend([(text, 3, 3) for text in ("FIRST", "SIBLING", "FIRST-NEXT", "SIBLING-NEXT")])
     prompt = [{"role": "user", "content": "same prompt"}]
@@ -2234,10 +2233,10 @@ async def test_versioned_sibling_chains_share_session_route_and_version():
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("versions", [(2, 3), (3, 4), (None, 3), (3, None)])
-async def test_pinned_session_rejects_conflicting_stamps_before_token_commit(versions):
-    session = GatewaySession(SessionHandle(session_id="pinned"), MessageCodec(FakeTokenizer()), weight_version=3)
-    backend = _VersionedBackend([("REJECTED", *versions)])
-    with pytest.raises(RuntimeError, match="conflicts with session weight_version"):
-        await _run(session, backend, [{"role": "user", "content": "prompt"}])
-    assert await session.finalize() == []
+@pytest.mark.parametrize("versions", [(2, 3), (3, 4)])
+async def test_session_preserves_backend_version_span_without_route_policy(versions):
+    session = GatewaySession(SessionHandle(session_id="versioned"), MessageCodec(FakeTokenizer()))
+    backend = _VersionedBackend([("ACCEPTED", *versions)])
+    await _run(session, backend, [{"role": "user", "content": "prompt"}])
+    [trajectory] = await session.finalize()
+    assert trajectory.extra_fields == {"min_global_steps": versions[0], "max_global_steps": versions[1]}

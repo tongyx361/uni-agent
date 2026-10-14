@@ -1235,6 +1235,23 @@ async def test_framework_binds_sampling_defaults_to_gateway_sessions(
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "step,expected", [(7, 7), (np.int64(7), 7), (None, None), (True, None), (-1, None), (7.5, None)]
+)
+async def test_framework_normalizes_optional_route_version(fake_tq, step, expected):
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)}, gateway_manager=runtime
+    )
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=step, validate=True))
+    assert runtime.created_session_kwargs[0]["weight_version"] == expected
+    if expected is not None:
+        assert type(runtime.created_session_kwargs[0]["weight_version"]) is int
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch, fake_tq):
     """Full ``generate_sequences`` path writes one TQ batch per successful
     session and trainer-compatible trajectory fields."""

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from uuid import uuid4
 
 import ray
 
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _SessionOwner:
     gateway_index: int
-    actor_created: bool = False
+    creation_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 async def _settle_call(awaitable):
@@ -77,7 +78,6 @@ class GatewayManager:
         ]
         ray.get([gateway.start.remote() for gateway in self.gateways])
         self.gateway_count = len(self.gateways)
-        self._llm_client = llm_client
         # Counts include closing sessions whose backend route still needs release.
         # Framework admission owns runner concurrency; these counts only balance actors.
         self.active_sessions_per_gateway = [0 for _ in self.gateways]
@@ -88,19 +88,10 @@ class GatewayManager:
             raise RuntimeError("No gateway actors configured")
         return min(range(len(self.gateways)), key=lambda index: self.active_sessions_per_gateway[index])
 
-    def _get_owner(self, session_id: str) -> _SessionOwner:
-        owner = self._session_owners.get(session_id)
-        if owner is None:
-            raise KeyError(session_id)
-        return owner
-
     async def create_session(self, session_id: str, *, weight_version: int | None = None, **kwargs):
         """Create a session; cancellation settles the remote call and aborts only its result."""
         if session_id in self._session_owners:
             raise RuntimeError(f"Session {session_id} already exists")
-        if getattr(self._llm_client, "bind_route", None) is not None and weight_version is not None:
-            if type(weight_version) is not int or weight_version < 0:
-                raise ValueError("weight_version must be a non-negative integer when set")
         gateway_index = self._select_gateway_index()
         # Reserve the slot synchronously, before the await. Sessions are created
         # concurrently on one event loop; if the counter were bumped after the
@@ -111,66 +102,39 @@ class GatewayManager:
         owner = _SessionOwner(gateway_index)
         self._session_owners[session_id] = owner
         self.active_sessions_per_gateway[gateway_index] += 1
-        create = asyncio.create_task(self._create_bound_session(session_id, owner, weight_version, kwargs))
+        call = create = None
         try:
-            return await asyncio.shield(create)
-        except asyncio.CancelledError:
-            cleanup, _ = await _settle_call(self._abort_cancelled_create(session_id, owner, create))
-            cleanup.result()
-            raise
-
-    async def _create_bound_session(self, session_id, owner, requested_version, kwargs):
-        expected_version = None
-        try:
-            bind_route = getattr(self._llm_client, "bind_route", None)
-            if bind_route is not None:
-                bound_version = await bind_route(session_id=session_id, weight_version=requested_version)
-                # Plain backends and calls without a trainer step stay unversioned.
-                # None explicitly permits latest-version continuation.
-                if requested_version is not None:
-                    if bound_version is not None and (
-                        type(bound_version) is not int or bound_version < requested_version
-                    ):
-                        raise ValueError(
-                            f"invalid bound weight_version {bound_version!r}, requested {requested_version}"
-                        )
-                    expected_version = bound_version
-            handle = await self.gateways[owner.gateway_index].create_session.remote(
-                session_id=session_id, weight_version=expected_version, **kwargs
+            call = self.gateways[gateway_index].create_session.remote(
+                session_id=session_id, weight_version=weight_version, creation_id=owner.creation_id, **kwargs
             )
-            owner.actor_created = True
-            return handle
-        except BaseException:
+            create = asyncio.ensure_future(call)
+            return await asyncio.shield(create)
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                if isinstance(call, ray.ObjectRef):
+                    ray.cancel(call)
+                if create is not None:
+                    await _settle_call(create)
+            cleanup, _ = await _settle_call(self._close_owner(session_id, owner, abort=True))
             try:
-                await self._release_route(session_id, owner)
+                cleanup.result()
             except (Exception, asyncio.CancelledError):
-                logger.exception("session %s: route release failed after create failure", session_id)
+                logger.exception("session %s: cleanup failed after create failure", session_id)
             raise
-
-    async def _abort_cancelled_create(self, session_id: str, owner: _SessionOwner, create: asyncio.Future) -> None:
-        try:
-            await create
-        except (Exception, asyncio.CancelledError):
-            # _create_bound_session settled its route; failed release retains its owner.
-            return
-        try:
-            await self._abort_owner(session_id, owner)
-        except (Exception, asyncio.CancelledError):
-            # A failed abort leaves this owner available for an explicit retry.
-            logger.exception("session %s: abort failed after cancelled create", session_id)
 
     async def finalize_session(self, session_id: str):
         """Finalize a session on its owning actor, release the route, and return its trajectories."""
-        owner = self._get_owner(session_id)
+        owner = self._session_owners[session_id]
         finalize, cancellation = await _settle_call(
-            self.gateways[owner.gateway_index].finalize_session.remote(session_id=session_id)
+            self.gateways[owner.gateway_index].finalize_session.remote(
+                session_id=session_id, creation_id=owner.creation_id, close=False
+            )
         )
         trajectories = finalize.result()
-        owner.actor_created = False
         # Trajectories are ordinary results before cleanup starts. Release can
         # retry without rematerializing them or transporting data in exceptions.
         for _ in range(2):
-            release, release_cancellation = await _settle_call(self._release_route(session_id, owner))
+            release, release_cancellation = await _settle_call(self._close_owner(session_id, owner))
             cancellation = cancellation or release_cancellation
             try:
                 release.result()
@@ -183,25 +147,19 @@ class GatewayManager:
 
     async def abort_session(self, session_id: str) -> None:
         """Abort a routed session on its owning actor and release the route."""
-        abort, cancellation = await _settle_call(self._abort_owner(session_id, self._get_owner(session_id)))
+        abort, cancellation = await _settle_call(
+            self._close_owner(session_id, self._session_owners[session_id], abort=True)
+        )
         abort.result()
         if cancellation is not None:
             raise cancellation
 
-    async def _abort_owner(self, session_id: str, owner: _SessionOwner) -> None:
-        if self._session_owners.get(session_id) is not owner:
-            return
-        if owner.actor_created:
-            await self.gateways[owner.gateway_index].abort_session.remote(session_id=session_id)
-            owner.actor_created = False
-        await self._release_route(session_id, owner)
-
-    async def _release_route(self, session_id: str, owner: _SessionOwner):
+    async def _close_owner(self, session_id: str, owner: _SessionOwner, *, abort: bool = False):
         if self._session_owners.get(session_id) is not owner:
             return None
-        release_route = getattr(self._llm_client, "release_route", None)
-        if release_route is not None:
-            await release_route(session_id=session_id)
+        gateway = self.gateways[owner.gateway_index]
+        close = gateway.abort_session if abort else gateway.close_session
+        await close.remote(session_id=session_id, creation_id=owner.creation_id)
         self._drop_route(session_id, owner)
 
     def _drop_route(self, session_id: str, owner: _SessionOwner) -> None:
