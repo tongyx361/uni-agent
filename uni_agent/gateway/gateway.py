@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from uuid import uuid4
 
 import ray
 from fastapi import FastAPI, HTTPException, Request
@@ -278,7 +279,7 @@ class _GatewayActor:
             coalesce_reserved_exact_requests=self._coalesce_reserved_exact_requests,
             metadata=metadata,
         )
-        session._creation_id = creation_id
+        session._creation_id = creation_id if creation_id is not None else uuid4().hex
         self._sessions[session_id] = session
         try:
             bind_route = getattr(self._backend, "bind_route", None)
@@ -288,7 +289,7 @@ class _GatewayActor:
                 raise RuntimeError(f"Session {session_id} closed during route binding")
         except BaseException:
             if self._sessions.get(session_id) is session:
-                cleanup, _ = await _settle_call(self.abort_session(session_id, creation_id=creation_id))
+                cleanup, _ = await _settle_call(self.abort_session(session_id, creation_id=session._creation_id))
                 try:
                     cleanup.result()
                 except (Exception, asyncio.CancelledError):
@@ -305,7 +306,7 @@ class _GatewayActor:
             raise KeyError(f"Session {session_id} belongs to a different creation")
         trajectories = await session.finalize()
         if close:
-            await self.close_session(session_id, creation_id=creation_id)
+            await self.close_session(session_id, creation_id=session._creation_id)
         return trajectories
 
     async def close_session(self, session_id: str, creation_id: str | None = None) -> None:
@@ -343,7 +344,7 @@ class _GatewayActor:
             except RuntimeError:
                 if session.phase != SessionPhase.FINALIZED:
                     raise
-        close, close_cancellation = await _settle_call(self.close_session(session_id, creation_id=creation_id))
+        close, close_cancellation = await _settle_call(self.close_session(session_id, creation_id=session._creation_id))
         close.result()
         if cancellation is not None or close_cancellation is not None:
             raise cancellation or close_cancellation

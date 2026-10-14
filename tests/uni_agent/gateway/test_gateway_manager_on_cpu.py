@@ -939,6 +939,42 @@ async def test_actor_rejects_late_bind_result_after_its_session_closes(creation_
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+async def test_legacy_create_failure_cleanup_cannot_abort_a_queued_replacement():
+    from uni_agent.gateway.session.session import SessionPhase
+
+    original_error = RuntimeError("original bind failed")
+    gateway = _RouteGateway()
+
+    class _BindOnlyClient:
+        async def bind_route(self, *, session_id, weight_version):
+            if weight_version == 3:
+                self.original_creation = gateway.actor._sessions[session_id]._creation_id
+                # This task runs when failed creation yields to its cleanup.
+                self.replacing = asyncio.create_task(self.replace())
+                raise original_error
+
+        async def replace(self):
+            await gateway.actor.finalize_session("reused", close=False)
+            await gateway.actor.close_session("reused")
+            await gateway.actor.create_session("reused", weight_version=4)
+            self.replacement = gateway.actor._sessions["reused"]
+
+    backend = _BindOnlyClient()
+    gateway.actor._backend = backend
+    with pytest.raises(RuntimeError) as raised:
+        await gateway.actor.create_session("reused", weight_version=3)
+    await asyncio.wait_for(backend.replacing, 2)
+    assert raised.value is original_error
+    assert gateway.actor._sessions["reused"] is backend.replacement
+    assert backend.replacement.phase == SessionPhase.ACTIVE
+    assert backend.original_creation != backend.replacement._creation_id
+    await gateway.actor.abort_session("reused")
+    assert gateway.actor._sessions == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 @pytest.mark.parametrize("concurrent_abort", [False, True])
 async def test_actor_release_settles_repeated_cancellation_and_concurrent_close(concurrent_abort):
     backend = _RouteClient()
@@ -1027,9 +1063,12 @@ async def test_manager_cancels_actor_bind_wait_without_waiting_for_readiness(ray
     )
     try:
         creation = asyncio.create_task(manager.create_session("pending"))
-        async with asyncio.timeout(10):
+
+        async def _wait_bound():
             while (await calls.counts.remote())[0] == 0:
                 await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_bound(), timeout=10)
         for _ in range(3):
             creation.cancel()
             await asyncio.sleep(0)
