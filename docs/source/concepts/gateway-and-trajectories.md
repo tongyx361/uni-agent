@@ -447,6 +447,12 @@ backend instance inside each actor. Backend clients may keep local session
 tokens and use a shared Router for routing state. Coroutines and Ray ObjectRefs
 are supported. Backends without these hooks keep their existing behavior.
 
+Hook implementations must fence route changes by session incarnation. Releasing
+a session must invalidate its pending binds; a late bind or release must never
+change a replacement route with the same ID. Actor creation IDs guard Gateway
+RPCs; the backend must enforce this rule in its routing authority. Laminar managed
+clients use captured session records and Router tokens for that protection.
+
 Framework passes a non-negative integer trainer step as the lowest acceptable
 weight version. Gateway binds after runner admission and before returning the
 session handle. The backend owns readiness waiting, version selection and
