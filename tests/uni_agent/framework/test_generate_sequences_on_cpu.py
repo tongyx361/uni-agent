@@ -1984,7 +1984,7 @@ async def test_score_trajectories_dispatches_only_final_trajectory():
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("termination", ["timeout", "parent_cancel", "completion_start_cancel"])
+@pytest.mark.parametrize("termination", ["timeout", "parent_cancel", "admission_complete_cancel"])
 async def test_ray_task_termination_cancels_runner_and_aborts_session(monkeypatch, fake_tq, termination):
     """Timeout and parent cancellation clean up both sides of a ray_task session.
 
@@ -2042,17 +2042,18 @@ async def test_ray_task_termination_cancels_runner_and_aborts_session(monkeypatc
     )
     framework._RUNNER_CANCEL_GRACE_SECONDS = 1.0
 
-    if termination == "completion_start_cancel":
-        original_admit = framework._run_batch_rollouts
+    if termination == "admission_complete_cancel":
+        original_submit = framework._submit_agent_episode
 
         async def cancel_after_admission(*args, **kwargs):
-            result = await original_admit(*args, **kwargs)
-            # Deliver cancellation at the handoff, before a newly created
-            # completion task can execute its first instruction.
+            episode = await original_submit(*args, **kwargs)
+            await remote_started.wait()
+            # Cancel the existing prompt owner as admission ends. No collector
+            # or completion task can inherit this episode's cleanup.
             asyncio.current_task().cancel()
-            return result
+            return episode
 
-        monkeypatch.setattr(framework, "_run_batch_rollouts", cancel_after_admission)
+        monkeypatch.setattr(framework, "_submit_agent_episode", cancel_after_admission)
 
     task = asyncio.create_task(framework.generate_sequences(_build_prompts(count=1, global_steps=3)))
     if termination == "parent_cancel":
@@ -2259,7 +2260,7 @@ async def test_submission_returns_before_gateway_and_reports_background_result(f
     with caplog.at_level(logging.ERROR, logger="uni_agent.framework.framework"):
         pending = list(framework._rollout_tasks)
         allow_create.set()
-        await asyncio.wait_for(asyncio.gather(*pending), 2)
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2)
     failures = [record for record in caplog.records if "batch failed after admission" in record.getMessage()]
     if runner_fails:
         assert len(failures) == 1
@@ -2281,15 +2282,16 @@ async def test_session_cancelled_before_first_execution_releases_its_slot(monkey
         agent_runners={"runner": {**_inline_runner_config(_async_noop_runner), "max_concurrent_sessions": 1}},
         gateway_manager=runtime,
     )
-    collect = framework._collect_prompt_rollouts
+    submit_episode = framework._submit_agent_episode
 
-    def cancel_before_collecting(*, tasks, **kwargs):
+    async def cancel_before_execution(**kwargs):
+        task = await submit_episode(**kwargs)
         assert framework._runner_semaphores["runner"]._value == 0
         assert not runtime.created_sessions
-        tasks[0].cancel()
-        return collect(tasks=tasks, **kwargs)
+        task.cancel()
+        return task
 
-    monkeypatch.setattr(framework, "_collect_prompt_rollouts", cancel_before_collecting)
+    monkeypatch.setattr(framework, "_submit_agent_episode", cancel_before_execution)
     with pytest.raises(asyncio.CancelledError):
         await framework.generate_sequences(_build_prompts(count=1))
     assert not runtime.created_sessions
@@ -2510,15 +2512,27 @@ async def test_collector_cancel_settles_uid_after_persistence(monkeypatch, fake_
 
     tasks = [asyncio.create_task(episode()) for _ in range(persisted_sessions + 1)]
     await asyncio.gather(*tasks)
-    collector = asyncio.create_task(
-        framework._collect_prompt_rollouts(uid="uid-0", tasks=tasks, global_steps=1, partition_id="train")
+
+    async def submit_episode(*, session_index, **_kwargs):
+        return tasks[session_index]
+
+    monkeypatch.setattr(framework, "_submit_agent_episode", submit_episode)
+    prompt_owner = asyncio.create_task(
+        framework._run_prompt_rollouts(
+            sample_fields={"uid": "uid-0"},
+            sample_index=0,
+            num_sessions=len(tasks),
+            global_steps=1,
+            partition_id="train",
+        )
     )
     await asyncio.wait_for(writing.wait(), 2)
-    collector.cancel()
+    prompt_owner.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(collector, 2)
-    assert fake_tq.puts == [
-        {"key": "uid-0", "partition_id": "train", "tag": {"status": "finished" if persisted_sessions else "failure"}},
+        await asyncio.wait_for(prompt_owner, 2)
+    assert [put["tag"]["status"] for put in fake_tq.puts] == [
+        "running",
+        "finished" if persisted_sessions else "failure",
     ]
 
 
@@ -2594,3 +2608,95 @@ async def test_repeated_admission_cancel_waits_for_detached_running_write(monkey
 
     assert not done, "admission must settle the remote running write before returning cancellation"
     assert [put["tag"]["status"] for put in fake_tq.puts] == ["running", "failure"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_unbounded_runner_admits_prompts_while_initial_status_is_blocked(monkeypatch, fake_tq):
+    first_write, allow_write, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    put = fake_tq.async_kv_put
+
+    async def blocked_first_status(**kwargs):
+        if kwargs["key"] == "uid-0" and kwargs["tag"]["status"] == "running":
+            first_write.set()
+            await allow_write.wait()
+        await put(**kwargs)
+
+    async def runner(*, sample_index, **_kwargs):
+        if sample_index == 1:
+            second_started.set()
+        return TaskResult(reward=1.0)
+
+    monkeypatch.setattr(fake_tq, "async_kv_put", blocked_first_status)
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(runner)},
+        gateway_manager=_FakeGatewayManager({"session-sample-": [_trajectory()]}),
+    )
+    submit = asyncio.create_task(framework.submit_sessions(_build_prompts(count=2)))
+    await asyncio.wait_for(first_write.wait(), 2)
+    await asyncio.wait_for(second_started.wait(), 2)
+    assert not submit.done()
+    allow_write.set()
+    await asyncio.wait_for(submit, 2)
+    await asyncio.wait_for(asyncio.gather(*framework._rollout_tasks), 2)
+    assert len(fake_tq.batch_puts) == 2
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["submit_sessions", "generate_sequences"])
+async def test_parent_cancel_before_batch_owner_starts_creates_no_sessions(monkeypatch, fake_tq, method):
+    runtime = _FakeGatewayManager({})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+    )
+    create_task = asyncio.create_task
+
+    def cancel_owner_at_creation(coroutine):
+        task = create_task(coroutine)
+        if coroutine.cr_code.co_name == "_finish_generation":
+            task.cancel()
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", cancel_owner_at_creation)
+    with pytest.raises(asyncio.CancelledError):
+        await getattr(framework, method)(_build_prompts(count=1))
+    assert not runtime.created_sessions
+    assert not fake_tq.puts
+    assert not framework._rollout_tasks
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_bounded_runner_admits_complete_prompt_groups_in_fifo_order(fake_tq):
+    started = asyncio.Queue()
+
+    async def runner(*, session, sample_index, **_kwargs):
+        release = asyncio.Event()
+        started.put_nowait((sample_index, session.session_id, release))
+        await release.wait()
+        return TaskResult(reward=1.0)
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": {**_inline_runner_config(runner), "max_concurrent_sessions": 1}},
+        gateway_manager=_FakeGatewayManager({"session-sample-": [_trajectory()]}),
+        n=2,
+    )
+    submit = asyncio.create_task(framework.submit_sessions(_build_prompts(count=2)))
+    order = []
+    for index in range(4):
+        sample_index, session_id, release = await asyncio.wait_for(started.get(), 2)
+        order.append((sample_index, session_id.split("-rollout-")[1].split("-")[0]))
+        assert started.empty()
+        if index < 3:
+            assert not submit.done()
+        else:
+            await asyncio.wait_for(submit, 2)
+        release.set()
+    await asyncio.wait_for(asyncio.gather(*framework._rollout_tasks), 2)
+    assert order == [(0, "0"), (0, "1"), (1, "0"), (1, "1")]
+    assert len(fake_tq.batch_puts) == 4

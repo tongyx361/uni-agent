@@ -452,12 +452,14 @@ These diagnostics do not change the task's resolution criteria.
 | `submit_sessions(prompts)` | Each session has acquired its Runner slot and been scheduled, or admission has failed. |
 
 `submit_sessions` does not wait for Gateway creation or episode completion.
-Framework retains the background tasks and writes their results to TransferQueue.
+One batch task owns admission, execution, cleanup, and TransferQueue delivery.
+The admission receipt completes while that same task continues to own its prompts.
 Sessions acquire capacity incrementally; independent Runners have separate admission
-lanes, so one saturated Runner does not block another. Failures after admission are
+lanes, so one saturated Runner does not block another. Unbounded Runners admit
+prompts concurrently, including their initial status writes. Failures after admission are
 logged by Framework; the admission return value is not a rollout success receipt.
 
-Cancelling admission cleans up episodes and collectors already started by that
+Cancelling admission drains the prompt owners and episodes already started by that
 submission, returns their slots, and settles their prompt status. Sessions waiting
 for capacity do not consume slots, and another batch's sessions remain unaffected.
 Previously persisted results are retained. This is local task cleanup, not
