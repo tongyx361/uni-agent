@@ -207,12 +207,13 @@ class GenerationMetrics:
     active_started_sum: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
+    _epoch: float = field(default_factory=lambda: time.perf_counter(), init=False, repr=False, compare=False)
 
     def begin(self) -> float:
         started_at = time.perf_counter()
         self.started += 1
         self.in_flight += 1
-        self.active_started_sum += started_at
+        self.active_started_sum += started_at - self._epoch
         return started_at
 
     def end(self, started_at: float, *, succeeded: bool) -> None:
@@ -221,7 +222,7 @@ class GenerationMetrics:
         if succeeded:
             self.completed_elapsed_s += elapsed
         self.in_flight -= 1
-        self.active_started_sum -= started_at
+        self.active_started_sum -= started_at - self._epoch
         if self.in_flight == 0:
             self.active_started_sum = 0.0
 
@@ -234,7 +235,7 @@ class GenerationMetrics:
             "model/requests_in_flight": self.in_flight,
             "model/request_completed_elapsed_s": self.completed_elapsed_s,
             "model/request_elapsed_s": (
-                self.finished_elapsed_s + time.perf_counter() * self.in_flight - self.active_started_sum
+                self.finished_elapsed_s + (time.perf_counter() - self._epoch) * self.in_flight - self.active_started_sum
             ),
             "model/input_tokens": self.input_tokens,
             "model/output_tokens": self.output_tokens,

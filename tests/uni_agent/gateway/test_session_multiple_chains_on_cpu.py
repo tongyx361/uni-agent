@@ -1,4 +1,5 @@
 import asyncio
+import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -2194,6 +2195,31 @@ async def test_weight_versions_absent_when_backend_omits_them():
     [trajectory] = await session.finalize()
 
     assert trajectory.extra_fields == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_generation_metrics_preserve_elapsed_precision_at_large_clock_offset(monkeypatch):
+    from uni_agent.gateway.session.session import GenerationMetrics
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr("uni_agent.gateway.session.session.time.perf_counter", lambda: clock[0])
+    metrics = GenerationMetrics()
+    starts = []
+    for index in range(256):
+        clock[0] = 1_000_000.0 + index / 1000
+        starts.append(metrics.begin())
+    clock[0] = 1_000_001.0
+    expected = math.fsum(clock[0] - started_at for started_at in starts)
+
+    assert metrics.started == metrics.in_flight == 256
+    assert metrics.snapshot()["model/request_elapsed_s"] == pytest.approx(expected, rel=0, abs=1e-9)
+    for index, started_at in enumerate(starts):
+        metrics.end(started_at, succeeded=index != 0)
+    assert metrics.in_flight == 0
+    assert metrics.active_started_sum == 0.0
+    assert metrics.snapshot()["model/request_elapsed_s"] == pytest.approx(expected, rel=0, abs=1e-9)
+    assert metrics.completed_elapsed_s == pytest.approx(expected - (clock[0] - starts[0]), rel=0, abs=1e-9)
 
 
 @pytest.mark.cpu
