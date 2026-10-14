@@ -562,9 +562,14 @@ class GatewayAgentFramework(AgentFramework):
             # which are not children of this coroutine (finish_batch does not
             # exist yet).
             try:
-                await self._abandon_admission_lanes(lane_tasks)
+                if await self._cancel_and_drain_tasks(lane_tasks):
+                    raise asyncio.CancelledError()
             finally:
-                await self._abandon_prompt_collectors(tasks)
+                try:
+                    if await self._cancel_and_drain_tasks(tasks):
+                        raise asyncio.CancelledError()
+                except Exception:
+                    logger.exception("failed to drain prompt collectors abandoned during batch admission")
             raise
         return tasks, outcomes
 
@@ -751,39 +756,19 @@ class GatewayAgentFramework(AgentFramework):
         cleanup.result()
         return cancelled
 
-    async def _abandon_admission_lanes(self, lane_tasks: list[asyncio.Task]) -> None:
-        """Cancel admission lanes and wait until each in-flight prompt has settled.
+    async def _cancel_and_drain_tasks(self, tasks: list[asyncio.Task]) -> bool:
+        """Cancel owned tasks once, retrieve all outcomes, and finish their cleanup.
 
-        A cancelled ``_run_prompt_rollouts`` aborts its admitted episodes and
-        marks its uid failed; shield the drain so a second cancel cannot skip it.
+        Return whether repeated cancellation interrupted the caller; prompt
+        owners must settle their uid before propagating it.
         """
-        for task in lane_tasks:
+        for task in tasks:
             cancelling = getattr(task, "cancelling", None)
-            if cancelling is None or not cancelling():
+            if not task.done() and (cancelling is None or not cancelling()):
                 task.cancel()
-        drain = asyncio.gather(*lane_tasks, return_exceptions=True)
-        if await self._settle_cleanup(drain):
-            raise asyncio.CancelledError()
-
-    async def _abandon_prompt_collectors(self, tasks: list[asyncio.Task]) -> None:
-        """Cancel prompt collectors admitted before a batch-level cancel and wait them out.
-
-        Each collector closes its own episode tasks and TransferQueue uid. Shield
-        the drain so a second cancel cannot skip that cleanup.
-        """
-        pending = [task for task in tasks if not task.done()]
-        for task in pending:
-            cancelling = getattr(task, "cancelling", None)
-            if cancelling is None or not cancelling():
-                task.cancel()
-        if not pending:
-            return
-        drain = asyncio.gather(*pending, return_exceptions=True)
-        try:
-            if await self._settle_cleanup(drain):
-                raise asyncio.CancelledError()
-        except Exception:
-            logger.exception("failed to drain prompt collectors abandoned during batch admission")
+        if not tasks:
+            return False
+        return await self._settle_cleanup(asyncio.gather(*tasks, return_exceptions=True))
 
     async def _abandon_uncollected_episodes(
         self,
@@ -797,17 +782,9 @@ class GatewayAgentFramework(AgentFramework):
         Otherwise those tasks keep semaphore and gateway slots, and TransferQueue
         stays at ``running`` with nobody left to write a terminal status.
         """
-        for task in tasks:
-            cancelling = getattr(task, "cancelling", None)
-            if cancelling is None or not cancelling():
-                task.cancel()
-        # Keep the gather task so a second cancel can still finish the drain
-        # before the terminal status write, matching _abandon_prompt_collectors.
-        drain = asyncio.gather(*tasks, return_exceptions=True) if tasks else None
         cancelled = False
         try:
-            if drain is not None:
-                cancelled = await self._settle_cleanup(drain)
+            cancelled = await self._cancel_and_drain_tasks(tasks)
         except Exception:
             logger.exception("uid %s: failed to drain episodes abandoned during admission", uid)
         await self._put_uid_status(uid=uid, partition_id=partition_id, status="failure", log_failure=True)
