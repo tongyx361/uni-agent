@@ -14,10 +14,10 @@ from uni_agent.framework import entry as entry_module
 pytestmark = [pytest.mark.cpu, pytest.mark.level0]
 
 
-def _build_framework():
+def _build_framework(runner_cap=1):
     from uni_agent.framework.framework import GatewayAgentFramework, _RunnerConfig
 
-    return GatewayAgentFramework(None, runner_registry={"runner": _RunnerConfig("unused", {}, "ray_task", 1)})
+    return GatewayAgentFramework(None, runner_registry={"runner": _RunnerConfig("unused", {}, "ray_task", runner_cap)})
 
 
 def test_real_ray_snapshot_while_default_generation_slots_are_saturated(tmp_path):
@@ -128,3 +128,51 @@ async def test_session_metrics_exclude_cancelled_capacity_waiters(monkeypatch):
             if task is not None:
                 task.cancel()
         await asyncio.gather(*(task for task in (running, waiting) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unbounded_session_metrics_settle_success_failure_and_cancellation(monkeypatch):
+    framework = _build_framework(runner_cap=0)
+    kwargs = dict(sample_fields={}, sample_index=0, session_index=0, global_steps=0, sampling_params={})
+    result = ([], {"result": "success"})
+
+    async def episode(**_kwargs):
+        return result
+
+    monkeypatch.setattr(framework, "_run_agent_episode", episode)
+    assert await framework._run_agent_episode_with_concurrency_limit(**kwargs) is result
+
+    error = RuntimeError("episode failed")
+
+    async def failing_episode(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(framework, "_run_agent_episode", failing_episode)
+    with pytest.raises(RuntimeError) as caught:
+        await framework._run_agent_episode_with_concurrency_limit(**kwargs)
+    assert caught.value is error
+
+    started = asyncio.Event()
+
+    async def waiting_episode(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(framework, "_run_agent_episode", waiting_episode)
+    running = asyncio.create_task(framework._run_agent_episode_with_concurrency_limit(**kwargs))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        metrics = framework.get_efficiency_metrics()
+        assert metrics["sessions/admitted"] == 3
+        assert metrics["sessions/completed"] == 2
+        assert metrics["sessions/in_flight"] == 1
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+    metrics = framework.get_efficiency_metrics()
+    assert metrics["sessions/admitted"] == metrics["sessions/completed"] == 3
+    assert metrics["sessions/in_flight"] == metrics["admission/wait_s"] == 0
+    assert framework._runner_semaphores == {}
