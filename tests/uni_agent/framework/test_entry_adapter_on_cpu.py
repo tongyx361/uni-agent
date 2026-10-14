@@ -15,9 +15,9 @@ from omegaconf import OmegaConf
 from uni_agent.framework import entry as entry_module
 from uni_agent.framework.base import AgentFramework
 
-pytestmark = [pytest.mark.cpu, pytest.mark.level0]
 
-
+@pytest.mark.cpu
+@pytest.mark.level0
 @pytest.mark.asyncio
 async def test_custom_framework_requires_explicit_admission_support():
     class CustomFramework(AgentFramework):
@@ -39,6 +39,8 @@ async def test_custom_framework_requires_explicit_admission_support():
     assert prompts == ["generated"]
 
 
+@pytest.mark.cpu
+@pytest.mark.level0
 @pytest.mark.parametrize(
     "runner_limits, expected_concurrency",
     [([], 1000), ([4, 6], 1000), ([0, None], 1000), ([600, 700, 0, None], 1300)],
@@ -62,6 +64,8 @@ def test_adapter_derives_worker_concurrency_from_session_limits(monkeypatch, run
     assert adapter.framework_worker is worker_class.remote.return_value
 
 
+@pytest.mark.cpu
+@pytest.mark.level0
 @pytest.mark.parametrize(
     "method, rpc, waits",
     [

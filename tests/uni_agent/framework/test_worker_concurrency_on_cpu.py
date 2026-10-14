@@ -14,6 +14,8 @@ import verl
 from uni_agent.framework import entry
 from uni_agent.framework import framework as framework_module
 from uni_agent.framework.framework import GatewayAgentFramework, _RunnerConfig
+from uni_agent.gateway.session import Trajectory
+from uni_agent.tasks import TaskResult
 from verl.utils import tensordict_utils as tu
 
 
@@ -25,7 +27,7 @@ def test_ray_admission_rpc_keeps_rollouts_alive_and_backpressures_next_batch():
             return None
 
         async def finalize_session(self, session_id):
-            return []
+            return [Trajectory(prompt_ids=[1], response_ids=[2], response_mask=[1])]
 
     class ControlledFramework(GatewayAgentFramework):
         def __init__(self):
@@ -48,18 +50,11 @@ def test_ray_admission_rpc_keeps_rollouts_alive_and_backpressures_next_batch():
             self.started.append(raw_prompt)
             await release.wait()
             self.completed.append(raw_prompt)
+            return TaskResult(reward=1.0)
 
-        async def _collect_prompt_rollouts(self, *, tasks, **_kwargs):
-            # Replace output persistence only; admission and lifetime use the real scheduler.
-            await asyncio.gather(*tasks)
-            return {
-                "num_success_sessions": len(tasks),
-                "num_failed_sessions": 0,
-                "num_success_outputs": len(tasks),
-                "num_unfinished_episodes": 0,
-                "num_failed_uids": 0,
-                "failure_reasons": [],
-            }
+        async def _write_session_trajectories_to_tq(self, **_kwargs):
+            # Replace only persistence; prompt admission and ownership stay real.
+            pass
 
     class ControlledWorker(entry.AgentFrameworkWorker.__ray_metadata__.modified_class):
         def __init__(self, expected_sources):
@@ -97,7 +92,8 @@ def test_ray_admission_rpc_keeps_rollouts_alive_and_backpressures_next_batch():
 
         second = worker.submit_sessions.remote(prompts("second"))
         assert not ray.wait([second], timeout=0.1)[0]
-        assert ray.get(worker.read_state.remote(), timeout=10) == (["first"], [], 1)
+        # Both owners exist already; the second waits for a permit without an episode.
+        assert ray.get(worker.read_state.remote(), timeout=10) == (["first"], [], 2)
         ray.get(worker.release.remote("first"), timeout=10)
         assert ray.get(second, timeout=10) is None
         assert ray.get(worker.read_state.remote(), timeout=10)[:2] == (["first", "second"], ["first"])
