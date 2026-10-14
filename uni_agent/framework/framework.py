@@ -776,34 +776,19 @@ class GatewayAgentFramework(AgentFramework):
                 raise ValueError(f"Unknown agent runner: {agent_name}") from exc
 
         runner_cap = runner_config.max_concurrent_sessions
-        if runner_cap <= 0:
-            with self._efficiency_lock:
-                self._admitted_sessions += 1
+        runner_semaphore = None
+        if runner_cap > 0:
+            runner_semaphore = self._runner_semaphores.get(runner_name)
+            if runner_semaphore is None:
+                runner_semaphore = asyncio.Semaphore(runner_cap)
+                self._runner_semaphores[runner_name] = runner_semaphore
+
+            wait_started = time.perf_counter()
             try:
-                return await self._run_agent_episode(
-                    sample_fields=sample_fields,
-                    sample_index=sample_index,
-                    session_index=session_index,
-                    global_steps=global_steps,
-                    runner_name=runner_name,
-                    runner_config=runner_config,
-                    sampling_params=sampling_params,
-                )
+                await runner_semaphore.acquire()
             finally:
                 with self._efficiency_lock:
-                    self._completed_sessions += 1
-
-        runner_semaphore = self._runner_semaphores.get(runner_name)
-        if runner_semaphore is None:
-            runner_semaphore = asyncio.Semaphore(runner_cap)
-            self._runner_semaphores[runner_name] = runner_semaphore
-
-        wait_started = time.perf_counter()
-        try:
-            await runner_semaphore.acquire()
-        finally:
-            with self._efficiency_lock:
-                self._admission_wait_s += time.perf_counter() - wait_started
+                    self._admission_wait_s += time.perf_counter() - wait_started
         with self._efficiency_lock:
             self._admitted_sessions += 1
         try:
@@ -819,7 +804,8 @@ class GatewayAgentFramework(AgentFramework):
         finally:
             with self._efficiency_lock:
                 self._completed_sessions += 1
-            runner_semaphore.release()
+            if runner_semaphore is not None:
+                runner_semaphore.release()
 
     async def _run_agent_episode(
         self,
