@@ -793,21 +793,6 @@ async def test_gateway_manager_cancelled_finalize_settles_actor_before_route_rel
     assert manager._session_owners == {}
 
 
-class _SharedRoutingClient:
-    def __init__(self, authority):
-        self.authority = authority
-
-    def bind_route(self, **kwargs):
-        return self.authority.bind.remote(**kwargs)
-
-    def release_route(self, **kwargs):
-        return self.authority.release.remote(**kwargs)
-
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None, **kwargs):
-        assert "weight_version" not in kwargs
-        return await self.authority.generate.remote(session_id=request_id)
-
-
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
@@ -816,6 +801,24 @@ async def test_gateway_manager_route_authority_is_shared_across_ray_client_copie
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.manager import GatewayManager
     from verl.workers.rollout.replica import TokenOutput
+
+    # Local classes are serialized by value; pytest's short module name is not
+    # importable in Ray workers that use the repository-root Python path.
+    class _SharedRoutingClient:
+        def __init__(self, authority):
+            self.authority = authority
+
+        def bind_route(self, **kwargs):
+            return self.authority.bind.remote(**kwargs)
+
+        def release_route(self, **kwargs):
+            return self.authority.release.remote(**kwargs)
+
+        async def generate(
+            self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None, **kwargs
+        ):
+            assert "weight_version" not in kwargs
+            return await self.authority.generate.remote(session_id=request_id)
 
     @ray.remote
     class _Authority:
