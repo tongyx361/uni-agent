@@ -254,6 +254,7 @@ class _GatewayActor:
         session_id: str,
         metadata: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
+        weight_version: int | None = None,
     ) -> SessionHandle:
         """Create an actor-owned session and return its provider-compatible handle."""
         self._require_started()
@@ -273,6 +274,7 @@ class _GatewayActor:
             enable_last_assistant_rollback=self._enable_last_assistant_rollback,
             coalesce_reserved_exact_requests=self._coalesce_reserved_exact_requests,
             metadata=metadata,
+            weight_version=weight_version,
         )
         return handle
 

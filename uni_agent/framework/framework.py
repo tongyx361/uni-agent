@@ -800,6 +800,7 @@ class GatewayAgentFramework(AgentFramework):
                 session_id,
                 metadata={"_trace_identity": trace_identity},
                 sampling_params=dict(sampling_params),
+                weight_version=global_steps if type(global_steps) is int and global_steps >= 0 else None,
             )
             logger.info(
                 "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",

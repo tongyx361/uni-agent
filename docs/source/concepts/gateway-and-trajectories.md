@@ -437,3 +437,35 @@ This context is independent of final reward-worker scores and training masks.
 For SWE-bench, the context includes `eval_exit_code`, per-test
 `eval_report.status_map`, and an `agent_error` when the agent reports one.
 These diagnostics do not change the task's resolution criteria.
+
+### Optional versioned backend routes
+
+`GatewayManager` calls optional awaitable backend hooks
+`bind_route(session_id=..., weight_version=...)` and
+`release_route(session_id=...)`. They run in the manager process; generation runs
+in Gateway actors with serialized copies of the client. Hooks must therefore use
+a shared routing authority, such as a Router actor, rather than store bindings in
+the client instance. Coroutines and Ray ObjectRefs are supported. Backends without
+these hooks keep their existing behavior.
+
+Framework passes a non-negative integer trainer step as the lowest acceptable
+weight version. The manager binds after runner admission and before returning the
+session handle. It validates the returned version and passes that final integer
+to the actor; a newer version is allowed when the requested one retired while
+waiting. A `None` result leaves the session unpinned for latest-version
+continuation. Calls without a trainer step remain unversioned.
+
+Every generation in a pinned session, including sibling trajectory chains, must
+report the bound version in both `min_global_steps` and `max_global_steps`.
+Conflicting stamps are rejected before tokens enter the trajectory. The version
+is not forwarded as a generation keyword; routing enforces the binding.
+
+Manager waits for cancelled creation to settle before aborting only the session
+it created, even if cancellation repeats. Finalization returns ordinary
+trajectories before route release starts. Release failure is retried once without
+losing the trajectories. Persistent cleanup failure retains the manager owner for
+an explicit `abort_session` retry; after actor removal, this retries only release.
+Failed creation preserves its original error and never aborts a session it did
+not create. Release must be idempotent. Manager load counts include owners awaiting
+cleanup; runner concurrency remains controlled by Framework admission. Caller
+cancellation waits for cleanup and then propagates.
