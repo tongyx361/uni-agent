@@ -2733,3 +2733,20 @@ async def test_bounded_runner_admits_complete_prompt_groups_in_fifo_order(fake_t
     await asyncio.wait_for(asyncio.gather(*framework._rollout_tasks), 2)
     assert order == [(0, "0"), (0, "1"), (1, "0"), (1, "1")]
     assert len(fake_tq.batch_puts) == 4
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "step,expected", [(7, 7), (np.int64(7), 7), (None, None), (True, None), (-1, None), (7.5, None)]
+)
+async def test_framework_normalizes_optional_route_version(fake_tq, step, expected):
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)}, gateway_manager=runtime
+    )
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=step, validate=True))
+    assert runtime.created_session_kwargs[0]["weight_version"] == expected
+    if expected is not None:
+        assert type(runtime.created_session_kwargs[0]["weight_version"]) is int

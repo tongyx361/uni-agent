@@ -37,7 +37,6 @@ ALLOWED_SAMPLING_KEYS = frozenset({"temperature", "top_p", "top_k", "max_tokens"
 async def test_gateway_abort_settles_generation_then_route_release_through_repeated_cancellation(cancel_phase):
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
-    from uni_agent.gateway.session.types import SessionRouteReleaseError
 
     backend = CancellationGatedRouteBackend()
     actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
@@ -61,7 +60,7 @@ async def test_gateway_abort_settles_generation_then_route_release_through_repea
         backend.release_cleanup.set()
         await asyncio.wait_for(backend.route_release_started.wait(), timeout=5)
         assert backend.cleanup_finished.is_set()
-        assert "abort-route" not in actor._sessions
+        assert "abort-route" in actor._sessions
         if cancel_phase in {"release", "both"}:
             for _ in range(2):
                 abort.cancel()
@@ -69,11 +68,7 @@ async def test_gateway_abort_settles_generation_then_route_release_through_repea
         assert not abort.done()
         assert not backend.route_release_finished.is_set()
         backend.allow_route_release.set()
-        if cancel_phase in {"release", "both"}:
-            with pytest.raises(SessionRouteReleaseError) as raised:
-                await asyncio.wait_for(abort, timeout=5)
-            assert isinstance(raised.value.__cause__, asyncio.CancelledError)
-        elif cancel_phase == "generation":
+        if cancel_phase != "none":
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(abort, timeout=5)
         else:
@@ -81,6 +76,7 @@ async def test_gateway_abort_settles_generation_then_route_release_through_repea
         with pytest.raises(asyncio.CancelledError):
             await generation
         assert backend.route_release_finished.is_set()
+        assert "abort-route" not in actor._sessions
         assert backend.bind_calls == [{"session_id": "abort-route", "weight_version": 3}]
         assert backend.release_calls == [{"session_id": "abort-route"}]
         metrics = await actor.get_efficiency_metrics()
@@ -1941,54 +1937,17 @@ class _ServedVersionBackend(SequencedBackend):
 @pytest.mark.level0
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "routed, served_version, bound_version, error",
-    [(False, 3, None, None), (True, 3, 4, RuntimeError), (True, 5, 5, None), (True, 3, 3, ValueError)],
-    ids=["plain-client", "version-conflict", "newer-bound-version", "stale-bound-version"],
-)
-async def test_gateway_actor_version_binding(route_actor, routed, served_version, bound_version, error):
-    from unittest.mock import AsyncMock
-
-    backend = _ServedVersionBackend(["OK"], served_version=served_version)
-    if routed:
-        backend.bind_route = AsyncMock(return_value=bound_version)
-        backend.release_route = AsyncMock()
-    actor = route_actor(backend)
-    if error is ValueError:
-        with pytest.raises(ValueError, match="below the requested version"):
-            await actor.create_session("versions", weight_version=4)
-        assert "versions" not in actor._sessions
-        backend.release_route.assert_awaited_once_with(session_id="versions")
-        return
-    await actor.create_session("versions", weight_version=4)
-    request = actor._handle_openai_chat_completions("versions", {"messages": [{"role": "user", "content": "hi"}]})
-    if error is RuntimeError:
-        with pytest.raises(RuntimeError, match="conflicts with session weight_version"):
-            await request
-    else:
-        await request
-        [trajectory] = await actor.finalize_session("versions")
-        assert trajectory.extra_fields["min_global_steps"] == served_version
-        assert trajectory.extra_fields["max_global_steps"] == served_version
-
-
-@pytest.mark.cpu
-@pytest.mark.level0
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     "release_error",
     [RuntimeError("route-release-failed"), asyncio.CancelledError()],
 )
 async def test_gateway_actor_abort_retries_failed_route_release(route_actor, release_error):
-    from uni_agent.gateway.session.types import SessionFinalizedReleaseError
-
     backend = _RouteBackend(release_error=release_error)
     actor = route_actor(backend)
     await actor.create_session("route-session")
-    with pytest.raises(SessionFinalizedReleaseError) as raised:
-        await actor.finalize_session("route-session")
-    assert raised.value.__cause__ is release_error
-    assert raised.value.trajectories == []
-    assert "route-session" not in actor._sessions
+    assert await actor.finalize_session("route-session", close=False) == []
+    with pytest.raises(type(release_error)):
+        await actor.close_session("route-session")
+    assert actor._sessions["route-session"].phase.value == "FINALIZED"
     assert backend.release_calls == [{"session_id": "route-session"}]
     backend.release_error = None
     await actor.abort_session("route-session")
@@ -2025,16 +1984,18 @@ async def test_gateway_actor_bind_error_survives_cancelled_route_release(route_a
     actor = route_actor(backend)
     with pytest.raises(RuntimeError, match="bind failed"):
         await actor.create_session("route-session")
-    assert "route-session" not in actor._sessions
+    assert "route-session" in actor._sessions
     assert backend.release_calls == [{"session_id": "route-session"}]
+
+    backend.release_error = None
+    await actor.abort_session("route-session")
+    assert "route-session" not in actor._sessions
 
 
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
 async def test_gateway_actor_repeated_cancellation_settles_route_release(route_actor):
-    from uni_agent.gateway.session.types import SessionFinalizedReleaseError
-
     class _SlowReleaseBackend(_RouteBackend):
         def __init__(self):
             super().__init__()
@@ -2057,9 +2018,9 @@ async def test_gateway_actor_repeated_cancellation_settles_route_release(route_a
         await asyncio.sleep(0)
     still_waiting = not finalize.done()
     backend.allow_release.set()
-    with pytest.raises(SessionFinalizedReleaseError) as raised:
+    with pytest.raises(asyncio.CancelledError):
         await finalize
-    assert raised.value.trajectories == []
+    assert "route-session" not in actor._sessions
     assert still_waiting
     assert backend.release_finished
 

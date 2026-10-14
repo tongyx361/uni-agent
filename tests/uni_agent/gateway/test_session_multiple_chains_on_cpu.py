@@ -2367,7 +2367,6 @@ async def test_versioned_sibling_chains_share_session_route_and_version():
     session = GatewaySession(
         SessionHandle(session_id="session-versioned-siblings"),
         MessageCodec(FakeTokenizer()),
-        weight_version=3,
     )
     backend = _VersionedBackend([(text, 3, 3) for text in ("FIRST", "SIBLING", "FIRST-NEXT", "SIBLING-NEXT")])
     prompt = [{"role": "user", "content": "same prompt"}]
@@ -2462,20 +2461,23 @@ async def test_backend_efficiency_metrics_include_waiting_failure_and_cancellati
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("returned_version", [(None, None), (4, 4), (3, 4)])
-async def test_version_rejection_settles_metrics_without_counting_or_committing_output(returned_version):
+async def test_backend_rejection_settles_metrics_without_counting_or_committing_output():
     from uni_agent.gateway.session.session import GenerationMetrics
 
     metrics = GenerationMetrics()
     session = GatewaySession(
         SessionHandle(session_id="session-version-metrics"),
         MessageCodec(FakeTokenizer()),
-        weight_version=3,
         generation_metrics=metrics,
     )
     messages = [{"role": "user", "content": "base"}]
-    with pytest.raises(RuntimeError, match="backend generation version conflicts"):
-        await _run(session, _VersionedBackend([("REJECTED", *returned_version)]), messages)
+
+    class RejectedBackend:
+        async def generate(self, **kwargs):
+            raise RuntimeError("backend rejected generation")
+
+    with pytest.raises(HTTPException, match="backend rejected generation"):
+        await _run(session, RejectedBackend(), messages)
     rejected = metrics.snapshot()
     assert rejected["model/requests_started"] == rejected["model/requests_failed"] == 1
     assert rejected["model/requests_completed"] == rejected["model/requests_in_flight"] == 0
@@ -2488,3 +2490,15 @@ async def test_version_rejection_settles_metrics_without_counting_or_committing_
     assert accepted["model/requests_started"] == 2
     assert accepted["model/requests_failed"] == accepted["model/requests_completed"] == 1
     assert accepted["model/requests_in_flight"] == 0
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("versions", [(2, 3), (3, 4)])
+async def test_session_preserves_backend_version_span_without_route_policy(versions):
+    session = GatewaySession(SessionHandle(session_id="versioned"), MessageCodec(FakeTokenizer()))
+    backend = _VersionedBackend([("ACCEPTED", *versions)])
+    await _run(session, backend, [{"role": "user", "content": "prompt"}])
+    [trajectory] = await session.finalize()
+    assert trajectory.extra_fields == {"min_global_steps": versions[0], "max_global_steps": versions[1]}

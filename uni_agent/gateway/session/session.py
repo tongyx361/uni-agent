@@ -261,7 +261,6 @@ class GatewaySession:
         enable_last_assistant_rollback: bool = True,
         coalesce_reserved_exact_requests: bool = True,
         metadata: dict[str, Any] | None = None,
-        weight_version: int | None = None,
         generation_metrics: GenerationMetrics | None = None,
     ):
         """Create an active session bound to a handle and model codec."""
@@ -269,8 +268,6 @@ class GatewaySession:
             raise ValueError(f"prompt_length must be positive when set, got {prompt_length}")
         if response_length is not None and response_length <= 0:
             raise ValueError(f"response_length must be positive when set, got {response_length}")
-        if weight_version is not None and (type(weight_version) is not int or weight_version < 0):
-            raise ValueError(f"weight_version must be a non-negative integer when set, got {weight_version!r}")
 
         self.handle = handle
         self._codec = codec
@@ -284,7 +281,6 @@ class GatewaySession:
         self._coalesce_reserved_exact_requests = coalesce_reserved_exact_requests
         self._metadata = dict(metadata or {})
         self._trace_identity = dict(self._metadata.get("_trace_identity") or {})
-        self._weight_version = weight_version
         self._generation_metrics = generation_metrics if generation_metrics is not None else GenerationMetrics()
         self.active_chains: list[ChainState] = []
         self.materialized_chains: list[MaterializedChain] = []
@@ -307,25 +303,6 @@ class GatewaySession:
     def sampling_params(self) -> dict[str, Any]:
         """Return a copy of the trusted per-session sampling defaults."""
         return dict(self._sampling_params)
-
-    def adopt_bound_weight_version(self, weight_version: int | None) -> None:
-        """Enforce the version the backend route actually bound.
-
-        The requested ``weight_version`` is the lowest acceptable version: a
-        session admitted after that version retired binds a newer one. ``None``
-        leaves the session unpinned so later turns can follow newer weights. Call
-        before the handle is published, so no generation used the old value.
-        """
-        if weight_version is None:
-            self._weight_version = None
-            return
-        if type(weight_version) is not int or weight_version < 0:
-            raise ValueError(f"bound weight_version must be a non-negative integer, got {weight_version!r}")
-        if self._weight_version is not None and weight_version < self._weight_version:
-            raise ValueError(
-                f"bound weight_version {weight_version} is below the requested version {self._weight_version}"
-            )
-        self._weight_version = weight_version
 
     async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
         """Own one generation task and settle it before propagating cancellation."""
@@ -486,15 +463,6 @@ class GatewaySession:
                     output.extra_fields.get("min_global_steps"),
                     output.extra_fields.get("max_global_steps"),
                 )
-                if self._weight_version is not None and generation_version != (
-                    self._weight_version,
-                    self._weight_version,
-                ):
-                    metrics.failed += 1
-                    raise RuntimeError(
-                        "backend generation version conflicts with session weight_version: "
-                        f"expected {(self._weight_version, self._weight_version)!r}, got {generation_version!r}"
-                    )
                 succeeded = True
                 metrics.completed += 1
                 metrics.input_tokens += len(encoded.context_ids)

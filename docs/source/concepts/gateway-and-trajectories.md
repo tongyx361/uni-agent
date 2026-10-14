@@ -453,12 +453,14 @@ These diagnostics do not change the task's resolution criteria.
 | `submit_sessions(prompts)` | Each session has acquired its Runner slot and been scheduled, or admission has failed. |
 
 `submit_sessions` does not wait for Gateway creation or episode completion.
-Framework retains the background tasks and writes their results to TransferQueue.
+One batch task owns admission, execution, cleanup, and TransferQueue delivery.
+The admission receipt completes while that same task continues to own its prompts.
 Sessions acquire capacity incrementally; independent Runners have separate admission
-lanes, so one saturated Runner does not block another. Failures after admission are
+lanes, so one saturated Runner does not block another. Unbounded Runners admit
+prompts concurrently, including their initial status writes. Failures after admission are
 logged by Framework; the admission return value is not a rollout success receipt.
 
-Cancelling admission cleans up episodes and collectors already started by that
+Cancelling admission drains the prompt owners and episodes already started by that
 submission, returns their slots, and settles their prompt status. Sessions waiting
 for capacity do not consume slots, and another batch's sessions remain unaffected.
 Previously persisted results are retained. This is local task cleanup, not
@@ -468,40 +470,37 @@ Custom Frameworks only need `generate_sequences` for ordinary generation. A call
 using `submit_sessions` must choose a Framework that explicitly implements it;
 there is no fallback that waits for full generation.
 
-
 ### Optional versioned backend routes
 
-A backend can implement the awaitable hooks
+Gateway actors call optional awaitable backend hooks
 `bind_route(session_id=..., weight_version=...)` and
-`release_route(session_id=...)`. Gateway binds the route before publishing the
-session handle and releases it after finalize or abort. The hook may return a
-coroutine or another awaitable, such as a Ray ObjectRef. Release must support
-retries after the actor session has already been removed.
+`release_route(session_id=...)`. Binding, generation and release use the same
+backend instance inside each actor. Backend clients may keep local session
+tokens and use a shared Router for routing state. Coroutines and Ray ObjectRefs
+are supported. Backends without these hooks keep their existing behavior.
 
-Framework supplies a non-negative integer `global_steps` as the requested
-`weight_version`; other values leave the session unversioned. For a route-binding
-backend, the request is the lowest acceptable version. `bind_route` may return a
-newer integer version if the requested one retired while the session waited.
-Returning `None` leaves the session unpinned so subsequent turns can follow
-newer weights. A lower or invalid returned version
-fails session creation and releases the partial route.
+Framework passes a non-negative integer trainer step as the lowest acceptable
+weight version. Gateway binds after runner admission and before returning the
+session handle. The backend owns readiness waiting, version selection and
+validation. Gateway ignores the bind result and never forwards the requested
+version as a generation keyword. Calls without a trainer step remain unversioned.
 
-Every generation in a versioned session, including sibling trajectory chains,
-must report matching `min_global_steps` and `max_global_steps` in its output
-metadata. A mismatch is rejected before committing tokens to the trajectory.
-The version is not forwarded as an extra generation keyword: the bound route
-owns it. Backends without `bind_route` retain their existing unversioned behavior
-and do not need new methods or response metadata.
+Gateway preserves the backend's `min_global_steps` and `max_global_steps` in
+trajectories. A backend that pins a session must validate its generation stamps;
+Laminar owns that policy through its routing client.
 
-Cancelling session creation waits for the remote creation result and aborts any
-session it created, even when cancellation repeats during cleanup. If abort
-fails before actor session removal, Manager keeps the route available for a
-retry. Failed-bind cleanup preserves the original binding error, including when
-route release is cancelled. If finalization succeeds but route release fails, Manager
-retries release once and preserves the finalized trajectories. Other finalize
-failures retain the routing entry for an explicit abort. Cleanup errors do not
-replace the original runner exception.
-
+Manager cancellation cancels pending Ray creation, settles its result, and aborts
+only that creation. A creation ID guards actor lifecycle calls from affecting a
+replacement session with the same ID; it is separate from a backend route token.
+Finalization returns ordinary trajectories before route release starts. Release
+failure is retried once without losing trajectories. Persistent failure retains
+the finalized actor session and manager owner for an explicit `abort_session`
+retry. Failed creation preserves its original error and cleanup ownership.
+The current Framework does not schedule this retry; its caller must do so.
+Release must be idempotent. Manager load counts include owners awaiting cleanup;
+Framework admission controls runner concurrency. Cancellation settles cleanup
+before it propagates. Direct actor callers can use `finalize_session(close=False)`
+followed by `close_session` to obtain trajectories before cleanup.
 
 ### Rollout efficiency observations
 

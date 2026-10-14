@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from uuid import uuid4
 
 import ray
 from fastapi import FastAPI, HTTPException, Request
@@ -29,15 +30,14 @@ from uni_agent.gateway.adapters.openai import (
 )
 from uni_agent.gateway.adapters.types import AnthropicRequest, MalformedRequestError, OpenAIChatCompletionRequest
 from uni_agent.gateway.config import GatewayActorConfig
+from uni_agent.gateway.manager import _settle_call
 from uni_agent.gateway.session import (
     GatewaySession,
     MessageCodec,
-    SessionFinalizedReleaseError,
     SessionHandle,
-    SessionRouteReleaseError,
     Trajectory,
 )
-from uni_agent.gateway.session.session import GenerationMetrics
+from uni_agent.gateway.session.session import GenerationMetrics, SessionPhase
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.utils import run_uvicorn
 
@@ -259,14 +259,9 @@ class _GatewayActor:
         metadata: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
         weight_version: int | None = None,
+        creation_id: str | None = None,
     ) -> SessionHandle:
-        """Create an actor-owned session, optionally bind its route, and return its handle.
-
-        ``weight_version`` is enforced on generations only when the backend binds
-        routes; other backends ignore it. It is the lowest acceptable version:
-        a ``bind_route`` that returns an int bound that (possibly newer) version,
-        and the session enforces the returned one. ``None`` leaves it unpinned.
-        """
+        """Create an actor-owned session and return its provider-compatible handle."""
         self._require_started()
         if session_id in self._sessions:
             raise RuntimeError(f"Session {session_id} already exists")
@@ -275,8 +270,7 @@ class _GatewayActor:
             session_id=session_id,
             base_url=f"{self._server_base_url}/sessions/{session_id}/v1",
         )
-        bind_route = getattr(self._backend, "bind_route", None)
-        self._sessions[session_id] = GatewaySession(
+        session = GatewaySession(
             handle=handle,
             codec=self._codec,
             prompt_length=self._prompt_length,
@@ -285,92 +279,77 @@ class _GatewayActor:
             enable_last_assistant_rollback=self._enable_last_assistant_rollback,
             coalesce_reserved_exact_requests=self._coalesce_reserved_exact_requests,
             metadata=metadata,
-            # Only bind_route can pin the replica version. Plain rollout clients
-            # stamp the version the server currently serves, which lags the batch
-            # step in verl v1 trainers, so enforcing it would reject every request.
-            weight_version=weight_version if bind_route is not None else None,
             generation_metrics=self._generation_metrics,
         )
-        if bind_route is not None:
-            try:
-                bound_version = await bind_route(session_id=session_id, weight_version=weight_version)
-                # Sessions wait for runner admission after dispatch picked the
-                # version, so the backend may bind a newer loadable one.
-                if weight_version is not None:
-                    self._sessions[session_id].adopt_bound_weight_version(bound_version)
-            except BaseException:
-                # Manager drops its routing entry when create fails. Drop the
-                # actor session too, or this id stays occupied and cannot be
-                # created or aborted again. HTTP lookup is _sessions, so pop
-                # before release; a release error must not hide the bind error.
-                await self._discard_session_after_failed_bind(session_id)
-                raise
+        session._creation_id = creation_id if creation_id is not None else uuid4().hex
+        self._sessions[session_id] = session
+        try:
+            bind_route = getattr(self._backend, "bind_route", None)
+            if bind_route is not None:
+                await bind_route(session_id=session_id, weight_version=weight_version)
+            if self._sessions.get(session_id) is not session or session.phase != SessionPhase.ACTIVE:
+                raise RuntimeError(f"Session {session_id} closed during route binding")
+        except BaseException:
+            if self._sessions.get(session_id) is session:
+                cleanup, _ = await _settle_call(self.abort_session(session_id, creation_id=session._creation_id))
+                try:
+                    cleanup.result()
+                except (Exception, asyncio.CancelledError):
+                    logger.exception("session %s: cleanup failed after route bind failure", session_id)
+            raise
         return handle
 
-    async def _discard_session_after_failed_bind(self, session_id: str) -> None:
-        try:
-            await self._remove_session(session_id)
-        except (Exception, asyncio.CancelledError):
-            logger.exception("session %s: route release failed after bind_route failure", session_id)
-
-    async def finalize_session(self, session_id: str) -> list[Trajectory]:
-        """Finalize a session, remove it from the actor, and return its trajectories.
-
-        Route release runs after the trajectories exist. If it fails, the session
-        is already gone, so the error carries the list instead of dropping it.
-        ``abort_session`` can retry release without redoing finalize.
-        """
+    async def finalize_session(
+        self, session_id: str, creation_id: str | None = None, *, close: bool = True
+    ) -> list[Trajectory]:
+        """Return trajectories before backend route cleanup starts."""
         session = self._get_session(session_id)
+        if creation_id is not None and session._creation_id != creation_id:
+            raise KeyError(f"Session {session_id} belongs to a different creation")
         trajectories = await session.finalize()
-        try:
-            await self._remove_session(session_id)
-        except BaseException as exc:
-            # CancelledError is a BaseException. The session is already popped,
-            # so a cancel during release must still carry the trajectories.
-            raise SessionFinalizedReleaseError(trajectories) from exc
+        if close:
+            await self.close_session(session_id, creation_id=session._creation_id)
         return trajectories
 
-    async def abort_session(self, session_id: str) -> None:
-        """Abort a live session and remove its route even if the session is already gone."""
+    async def close_session(self, session_id: str, creation_id: str | None = None) -> None:
+        """Release the backend route, retaining the session if cleanup fails."""
         session = self._sessions.get(session_id)
-        cancellation: asyncio.CancelledError | None = None
-        if session is not None:
-            try:
-                await session.abort()
-            except asyncio.CancelledError as exc:
-                # Session.abort settles generation before surfacing cancellation.
-                # Finish the actor's route release before propagating it too.
-                cancellation = exc
-        try:
-            await self._remove_session(session_id)
-        except BaseException as exc:
-            # The session is already popped, so only the route is left. Tag the
-            # failure so the manager still frees its routing slot. Retry abort
-            # to release the route again.
-            raise SessionRouteReleaseError() from exc
-        if cancellation is not None:
-            raise cancellation
-
-    async def _remove_session(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
-
-        release_route = getattr(self._backend, "release_route", None)
-        if release_route is None:
+        if session is None or (creation_id is not None and session._creation_id != creation_id):
             return
-        # Pop already happened. Finish release even if this task is cancelled,
-        # then let the caller observe that cancellation (finalize wraps it).
-        # ensure_future, not create_task: backends such as Laminar's
-        # LLMServerClient return a Ray ObjectRef, which is awaitable but not a coroutine.
-        release_task = asyncio.ensure_future(release_route(session_id=session_id))
-        cancellation: asyncio.CancelledError | None = None
-        while not release_task.done():
+        async with session.request_lock:
+            if self._sessions.get(session_id) is not session:
+                return
+            if session.phase == SessionPhase.ACTIVE:
+                raise RuntimeError(f"Session {session_id} must be finalized or aborted before close")
+            release_route = getattr(self._backend, "release_route", None)
+            cancellation = None
+            if release_route is not None:
+                release, cancellation = await _settle_call(release_route(session_id=session_id))
+                release.result()
+            if self._sessions.get(session_id) is session:
+                del self._sessions[session_id]
+            if cancellation is not None:
+                raise cancellation
+
+    async def abort_session(self, session_id: str, creation_id: str | None = None) -> None:
+        """Abort generation admission, then close the same session's backend route."""
+        session = self._sessions.get(session_id)
+        if session is None or (creation_id is not None and session._creation_id != creation_id):
+            return
+        cancellation = None
+        if session.phase != SessionPhase.FINALIZED:
+            abort, cancellation = await _settle_call(session.abort())
             try:
-                await asyncio.shield(release_task)
+                abort.result()
             except asyncio.CancelledError as exc:
                 cancellation = cancellation or exc
-        release_task.result()
-        if cancellation is not None:
-            raise cancellation
+            except RuntimeError:
+                if session.phase != SessionPhase.FINALIZED:
+                    raise
+        close, close_cancellation = await _settle_call(self.close_session(session_id, creation_id=session._creation_id))
+        close.result()
+        if cancellation is not None or close_cancellation is not None:
+            raise cancellation or close_cancellation
 
     async def get_efficiency_metrics(self) -> dict[str, int | float]:
         """Return cumulative backend counters, including currently waiting calls."""

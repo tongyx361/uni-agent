@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
+from numbers import Integral
 from pathlib import Path
 from uuid import uuid4
 
@@ -1016,7 +1017,11 @@ class GatewayAgentFramework(AgentFramework):
         # Route-binding backends pin the replica to this batch's trainer step or,
         # when the session waited for admission past that version, a newer one.
         # Validation without global_steps, or any non-int / negative value, stays unversioned.
-        weight_version = global_steps if type(global_steps) is int and global_steps >= 0 else None
+        weight_version = (
+            int(global_steps)
+            if isinstance(global_steps, Integral) and not isinstance(global_steps, bool) and global_steps >= 0
+            else None
+        )
         async with _log_scope(parent_log):
             session = await self.gateway_manager.create_session(
                 session_id,
