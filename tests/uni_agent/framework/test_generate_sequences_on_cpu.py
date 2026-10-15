@@ -2672,8 +2672,19 @@ async def test_parent_cancel_before_batch_owner_starts_creates_no_sessions(monke
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-async def test_bounded_runner_admits_complete_prompt_groups_in_fifo_order(fake_tq):
+@pytest.mark.parametrize("runner_name", ["runner", ""])
+async def test_bounded_runner_admits_complete_prompt_groups_in_fifo_order(monkeypatch, fake_tq, runner_name):
     started = asyncio.Queue()
+    first_write, allow_write = asyncio.Event(), asyncio.Event()
+    put = fake_tq.async_kv_put
+
+    async def blocked_first_status(**kwargs):
+        if kwargs["key"] == "uid-0" and kwargs["tag"]["status"] == "running":
+            first_write.set()
+            await allow_write.wait()
+        await put(**kwargs)
+
+    monkeypatch.setattr(fake_tq, "async_kv_put", blocked_first_status)
 
     async def runner(*, session, sample_index, **_kwargs):
         release = asyncio.Event()
@@ -2682,14 +2693,23 @@ async def test_bounded_runner_admits_complete_prompt_groups_in_fifo_order(fake_t
         return TaskResult(reward=1.0)
 
     framework = await _build_framework_with_agent_runners(
-        agent_runners={"runner": {**_inline_runner_config(runner), "max_concurrent_sessions": 1}},
+        agent_runners={runner_name: {**_inline_runner_config(runner), "max_concurrent_sessions": 1}},
         gateway_manager=_FakeGatewayManager({"session-sample-": [_trajectory()]}),
         n=2,
     )
     submit = asyncio.create_task(framework.submit_sessions(_build_prompts(count=2)))
+    await asyncio.wait_for(first_write.wait(), 2)
+    first_session = asyncio.create_task(started.get())
+    premature, _ = await asyncio.wait((first_session,), timeout=0.1)
+    allow_write.set()
+    if not premature:
+        first_session.cancel()
+        await asyncio.gather(first_session, return_exceptions=True)
     order = []
     for index in range(4):
-        sample_index, session_id, release = await asyncio.wait_for(started.get(), 2)
+        sample_index, session_id, release = (
+            first_session.result() if index == 0 and premature else await asyncio.wait_for(started.get(), 2)
+        )
         order.append((sample_index, session_id.split("-rollout-")[1].split("-")[0]))
         assert started.empty()
         if index < 3:
@@ -2698,5 +2718,6 @@ async def test_bounded_runner_admits_complete_prompt_groups_in_fifo_order(fake_t
             await asyncio.wait_for(submit, 2)
         release.set()
     await asyncio.wait_for(asyncio.gather(*framework._rollout_tasks), 2)
+    assert not premature, "a later prompt must not pass a bounded runner's blocked initial status write"
     assert order == [(0, "0"), (0, "1"), (1, "0"), (1, "1")]
     assert len(fake_tq.batch_puts) == 4

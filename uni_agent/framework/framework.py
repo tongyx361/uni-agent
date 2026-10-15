@@ -624,7 +624,11 @@ class GatewayAgentFramework(AgentFramework):
         for index, fields in enumerate(sample_fields):
             runner_name = self._admission_lane(fields)
             # Unbounded runners must not serialize slow initial status writes.
-            lane = runner_name if runner_name and self.runner_registry[runner_name].max_concurrent_sessions else index
+            lane = (
+                runner_name
+                if runner_name is not None and self.runner_registry[runner_name].max_concurrent_sessions
+                else index
+            )
             lanes.setdefault(lane, []).append(index)
 
         async def admit_lane(indices: list[int]) -> None:
