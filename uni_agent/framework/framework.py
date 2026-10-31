@@ -195,6 +195,8 @@ _TQ_NESTED_SEQUENCE_FIELDS = {
     "attention_mask",
     "position_ids",
     "rollout_log_probs",
+    "rollout_topk_ids",
+    "rollout_topk_log_probs",
     "routed_experts",
     "rm_scores",
     "teacher_logprobs",
@@ -245,8 +247,8 @@ def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorD
         values = [field[key] for field in fields]
         if not all(isinstance(value, torch.Tensor) for value in values):
             continue
-        if key == "routed_experts":
-            ragged_idx = 1  # [seq, layers, topk]: ragged on the sequence dim
+        if key in {"routed_experts", "rollout_topk_ids", "rollout_topk_log_probs"}:
+            ragged_idx = 1  # [seq, ...]: ragged on the sequence dim
         elif key == "position_ids" and values[0].dim() == 2:
             ragged_idx = 2
         else:
@@ -534,9 +536,12 @@ class GatewayAgentFramework(AgentFramework):
                 top_p=config.val_kwargs.top_p,
                 top_k=config.val_kwargs.top_k,
             )
+        elif getattr(config, "topk_log_probs", 0):
+            sampling_params["topk_log_probs"] = int(config.topk_log_probs)
         # An explicit greedy flag overrides the partition sampling defaults.
         if "__do_sample__" in sample_fields and not bool(sample_fields["__do_sample__"]):
             sampling_params.update(temperature=0, top_p=1.0, top_k=-1)
+            sampling_params.pop("topk_log_probs", None)
         return sampling_params
 
     def record_efficiency_metrics(self, metrics: dict[str, float]) -> None:
@@ -1589,13 +1594,27 @@ class GatewayAgentFramework(AgentFramework):
             aligned_experts = _align_routed_experts(trajectory.routed_experts, input_ids.size(0))
             if aligned_experts is not None:
                 field["routed_experts"] = aligned_experts
+        extra_fields = dict(trajectory.extra_fields)
+        response_topk_ids = extra_fields.pop("response_topk_ids", None)
+        response_topk_log_probs = extra_fields.pop("response_topk_log_probs", None)
+        if response_topk_ids is not None and response_topk_log_probs is not None:
+            from verl.trainer.ppo.score_centering import pad_rollout_topk
+
+            if len(response_topk_ids) != responses.size(0):
+                raise ValueError(
+                    f"sampler top-k heads cover {len(response_topk_ids)} tokens, "
+                    f"but the response has {responses.size(0)}."
+                )
+            field["rollout_topk_ids"], field["rollout_topk_log_probs"] = pad_rollout_topk(
+                response_topk_ids, response_topk_log_probs, prompt_length=prompts.size(0)
+            )
         rm_scores = torch.zeros_like(responses, dtype=torch.float32)
         if trajectory.reward_score is not None and responses.numel() > 0:
             rm_scores[-1] = float(trajectory.reward_score)
         field["rm_scores"] = rm_scores
 
         field["extra_fields"] = {
-            **trajectory.extra_fields,
+            **extra_fields,
             "reward_extra_info": dict(trajectory.reward_metrics),
         }
         # Framework-owned masks must win over same-named Gateway extra fields.

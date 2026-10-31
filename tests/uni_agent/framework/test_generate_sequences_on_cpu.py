@@ -1853,6 +1853,62 @@ async def test_generate_sequences_omits_missing_rollout_log_probs(fake_tq):
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+async def test_generate_sequences_pads_and_writes_rollout_topk_heads(fake_tq):
+    k = 4
+    resp_ids = [20, 21, 22]
+    topk_ids = np.arange(len(resp_ids) * k, dtype=np.int32).reshape(len(resp_ids), k)
+    topk_lp = -np.ones((len(resp_ids), k), dtype=np.float32) * 0.25
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(
+                    prompt_ids=[10, 11],
+                    response_ids=resp_ids,
+                    response_mask=[1, 0, 1],
+                    response_logprobs=[-0.1, 0.0, -0.2],
+                    extra_fields={
+                        "response_topk_ids": topk_ids,
+                        "response_topk_log_probs": topk_lp,
+                    },
+                )
+            ]
+        }
+    )
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        n=1,
+        val_n=1,
+    )
+    framework._rollout_config.topk_log_probs = k
+    framework._rollout_config.calculate_log_probs = True
+
+    train_params = framework._build_session_sampling_params(partition_id="train", sample_fields={})
+    val_params = framework._build_session_sampling_params(partition_id="val", sample_fields={})
+    greedy_params = framework._build_session_sampling_params(
+        partition_id="train", sample_fields={"__do_sample__": False}
+    )
+    assert train_params["topk_log_probs"] == k
+    assert "topk_log_probs" not in val_params
+    assert "topk_log_probs" not in greedy_params
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=10))
+
+    fields = fake_tq.batch_puts[0]["fields"]
+    assert fields["rollout_topk_ids"].is_nested
+    assert fields["rollout_topk_log_probs"].is_nested
+    assert fields["rollout_topk_ids"][0].shape == (5, k)
+    assert fields["rollout_topk_log_probs"][0].shape == (5, k)
+    # Prompt length is 2, so response token r's head sits at row 2 - 1 + r = 1 + r
+    assert fields["rollout_topk_ids"][0][1:4].tolist() == topk_ids.tolist()
+    assert "response_topk_ids" not in tu.get(fields, "extra_fields")[0]
+    assert "response_topk_log_probs" not in tu.get(fields, "extra_fields")[0]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 async def test_generate_sequences_keeps_other_prompts_when_one_prompt_fails(fake_tq):
     """Prompt-level failures are isolated: one uid can fail while another uid
     in the same batch still writes successful output."""

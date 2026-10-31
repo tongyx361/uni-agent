@@ -6,11 +6,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+import numpy as np
 from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
@@ -73,6 +75,8 @@ class TrajectoryBuffer:
     response_ids: list[int] = field(default_factory=list)
     response_mask: list[int] = field(default_factory=list)
     response_logprobs: list[float] = field(default_factory=list)
+    response_topk_ids: np.ndarray | None = None
+    response_topk_log_probs: np.ndarray | None = None
     routed_experts: Any | None = None
     generation_versions: list[tuple[int | None, int | None]] = field(default_factory=list)
 
@@ -538,10 +542,56 @@ class GatewaySession:
             prompt_length = len(encoded.buffer.prompt_ids)
             if merged_token_ids[:prompt_length] != encoded.buffer.prompt_ids:
                 raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
+            prev_response_len = len(encoded.buffer.response_ids)
             encoded.buffer.response_ids = list(merged_token_ids[prompt_length:])
             encoded.buffer.response_mask = list(response_mask)
             encoded.buffer.response_logprobs = list(response_logprobs or [])
             encoded.buffer.generation_versions.append(generation_version)
+
+            topk_k = int(encoded.sampling_params.get("topk_log_probs", 0) or 0)
+            if topk_k > 0:
+                out_topk_ids = output.extra_fields.get("response_topk_ids")
+                out_topk_log_probs = output.extra_fields.get("response_topk_log_probs")
+                if out_topk_ids is None or out_topk_log_probs is None:
+                    raise RuntimeError("backend omitted response_topk_ids/response_topk_log_probs when requested")
+                out_topk_ids = np.asarray(out_topk_ids, dtype=np.int32)
+                out_topk_log_probs = np.asarray(out_topk_log_probs, dtype=np.float32)
+                if out_topk_ids.shape != (len(response_ids), topk_k) or out_topk_log_probs.shape != (
+                    len(response_ids),
+                    topk_k,
+                ):
+                    raise RuntimeError(
+                        "backend top-k heads must have shape (len(token_ids), topk_log_probs): "
+                        f"expected {(len(response_ids), topk_k)}, got ids={out_topk_ids.shape}, "
+                        f"log_probs={out_topk_log_probs.shape}"
+                    )
+                if encoded.buffer.response_topk_ids is None:
+                    if prev_response_len > 0:
+                        encoded.buffer.response_topk_ids, encoded.buffer.response_topk_log_probs = (
+                            self._dummy_topk_rows(prev_response_len, topk_k)
+                        )
+                    else:
+                        encoded.buffer.response_topk_ids = np.empty((0, topk_k), dtype=np.int32)
+                        encoded.buffer.response_topk_log_probs = np.empty((0, topk_k), dtype=np.float32)
+                inserted_count = len(encoded.buffer.response_ids) - prev_response_len - len(response_ids)
+                if inserted_count < 0:
+                    self._truncate_buffer_topk(encoded.buffer, prev_response_len + inserted_count)
+                elif inserted_count > 0:
+                    self._append_dummy_buffer_topk(encoded.buffer, inserted_count)
+                assert encoded.buffer.response_topk_ids is not None
+                assert encoded.buffer.response_topk_log_probs is not None
+                encoded.buffer.response_topk_ids = np.concatenate(
+                    [encoded.buffer.response_topk_ids, out_topk_ids], axis=0
+                )
+                encoded.buffer.response_topk_log_probs = np.concatenate(
+                    [encoded.buffer.response_topk_log_probs, out_topk_log_probs], axis=0
+                )
+            elif encoded.buffer.response_topk_ids is not None:
+                delta_len = len(encoded.buffer.response_ids) - prev_response_len
+                if delta_len < 0:
+                    self._truncate_buffer_topk(encoded.buffer, len(encoded.buffer.response_ids))
+                elif delta_len > 0:
+                    self._append_dummy_buffer_topk(encoded.buffer, delta_len)
             self._assert_response_logprob_alignment(encoded.buffer)
 
             # R3 router replay: the backend returns routing for the full context
@@ -781,6 +831,7 @@ class GatewaySession:
                 del buffer.response_ids[rollback_response_len:]
                 del buffer.response_mask[rollback_response_len:]
                 del buffer.response_logprobs[rollback_response_len:]
+                self._truncate_buffer_topk(buffer, rollback_response_len)
 
                 assistant_prefix = self._codec.turn_separator + self._codec.generation_prompt
                 stored_ids = buffer.prompt_ids if rollback_response_len == 0 else buffer.response_ids
@@ -791,6 +842,7 @@ class GatewaySession:
                 if rollback_response_len:
                     del buffer.response_mask[assistant_prefix_start:]
                     del buffer.response_logprobs[assistant_prefix_start:]
+                    self._truncate_buffer_topk(buffer, assistant_prefix_start)
                 self._assert_response_logprob_alignment(buffer)
                 incremental_messages = messages[last_assistant_start.message_history_len :]
                 previous_messages = messages[: last_assistant_start.message_history_len]
@@ -839,9 +891,16 @@ class GatewaySession:
                 prompt_length = len(buffer.prompt_ids)
                 if merged_token_ids[:prompt_length] != buffer.prompt_ids:
                     raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
+                prev_response_len = len(buffer.response_ids)
                 buffer.response_ids = list(merged_token_ids[prompt_length:])
                 buffer.response_mask = list(merged_response_mask)
                 buffer.response_logprobs = list(merged_response_logprobs or [])
+                if buffer.response_topk_ids is not None:
+                    delta_len = len(buffer.response_ids) - prev_response_len
+                    if delta_len < 0:
+                        self._truncate_buffer_topk(buffer, len(buffer.response_ids))
+                    elif delta_len > 0:
+                        self._append_dummy_buffer_topk(buffer, delta_len)
                 self._assert_response_logprob_alignment(buffer)
                 if appended_images:
                     if image_data is None:
@@ -1026,6 +1085,10 @@ class GatewaySession:
             response_ids=list(buffer.response_ids),
             response_mask=list(buffer.response_mask),
             response_logprobs=list(buffer.response_logprobs),
+            response_topk_ids=None if buffer.response_topk_ids is None else buffer.response_topk_ids.copy(),
+            response_topk_log_probs=(
+                None if buffer.response_topk_log_probs is None else buffer.response_topk_log_probs.copy()
+            ),
             routed_experts=buffer.routed_experts,
             generation_versions=list(buffer.generation_versions),
         )
@@ -1046,6 +1109,37 @@ class GatewaySession:
             0,
             len(buffer.response_ids),
         }, "response_logprobs must be empty or aligned with response_ids"
+        assert (buffer.response_topk_ids is None) == (
+            buffer.response_topk_log_probs is None
+        ), "response_topk_ids and response_topk_log_probs must be both present or both None"
+        if buffer.response_topk_ids is not None and buffer.response_topk_log_probs is not None:
+            assert (
+                buffer.response_topk_ids.ndim == 2
+                and buffer.response_topk_log_probs.shape == buffer.response_topk_ids.shape
+                and buffer.response_topk_ids.shape[0] == len(buffer.response_ids)
+            ), "response_topk_ids and response_topk_log_probs must be 2D arrays aligned with response_ids"
+
+    @staticmethod
+    def _dummy_topk_rows(num_rows: int, k: int) -> tuple[np.ndarray, np.ndarray]:
+        ids = np.broadcast_to(np.arange(k, dtype=np.int32), (num_rows, k)).copy()
+        log_probs = np.full((num_rows, k), -math.log(k), dtype=np.float32)
+        return ids, log_probs
+
+    @classmethod
+    def _truncate_buffer_topk(cls, buffer: TrajectoryBuffer, length: int) -> None:
+        if buffer.response_topk_ids is not None:
+            buffer.response_topk_ids = buffer.response_topk_ids[:length].copy()
+        if buffer.response_topk_log_probs is not None:
+            buffer.response_topk_log_probs = buffer.response_topk_log_probs[:length].copy()
+
+    @classmethod
+    def _append_dummy_buffer_topk(cls, buffer: TrajectoryBuffer, num_rows: int) -> None:
+        if num_rows <= 0 or buffer.response_topk_ids is None or buffer.response_topk_log_probs is None:
+            return
+        k = int(buffer.response_topk_ids.shape[1])
+        dummy_ids, dummy_log_probs = cls._dummy_topk_rows(num_rows, k)
+        buffer.response_topk_ids = np.concatenate([buffer.response_topk_ids, dummy_ids], axis=0)
+        buffer.response_topk_log_probs = np.concatenate([buffer.response_topk_log_probs, dummy_log_probs], axis=0)
 
     def _snapshot_last_assistant_start(
         self,
@@ -1209,6 +1303,9 @@ class GatewaySession:
         mm_processor_kwargs = self._codec.mm_processor_kwargs
         if mm_processor_kwargs:
             trajectory_extra_fields["mm_processor_kwargs"] = mm_processor_kwargs
+        if chain.buffer.response_topk_ids is not None and chain.buffer.response_topk_log_probs is not None:
+            trajectory_extra_fields["response_topk_ids"] = chain.buffer.response_topk_ids
+            trajectory_extra_fields["response_topk_log_probs"] = chain.buffer.response_topk_log_probs
         return Trajectory(
             prompt_ids=list(chain.buffer.prompt_ids),
             response_ids=list(chain.buffer.response_ids),

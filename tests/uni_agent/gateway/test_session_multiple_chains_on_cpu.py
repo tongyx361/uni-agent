@@ -2581,3 +2581,76 @@ async def test_image_requires_multimodal_processor_before_backend(role):
         await _run(session, backend, [{"role": "user", "content": "start"}, message])
     assert backend.calls == []
     assert await session.finalize() == []
+
+
+
+def test_session_accumulates_and_rolls_back_topk_heads_across_turns() -> None:
+    import numpy as np
+
+    session = _session("topk-multi-turn", enable_last_assistant_rollback=True)
+    k = 3
+
+    class Backend:
+        def __init__(self):
+            self.turn = 0
+
+        async def generate(self, *, sampling_params, **kwargs):
+            self.turn += 1
+            assert sampling_params["topk_log_probs"] == k
+            if self.turn == 1:
+                ids = _ids("call")
+                base = 10
+            elif self.turn == 2:
+                ids = _ids("retry")
+                base = 20
+            else:
+                ids = _ids("done")
+                base = 30
+            n = len(ids)
+            return TokenOutput(
+                token_ids=ids,
+                log_probs=[-0.1] * n,
+                stop_reason="stop",
+                extra_fields={
+                    "response_topk_ids": np.full((n, k), base, dtype=np.int32),
+                    "response_topk_log_probs": np.full((n, k), -float(base), dtype=np.float32),
+                },
+            )
+
+    async def scenario():
+        backend = Backend()
+        msg1 = [HELPFUL_SYS, {"role": "user", "content": "fix bug"}]
+        await session.run_generation(
+            {"messages": msg1, "tools": None, "sampling_params": {"logprobs": True, "topk_log_probs": k}},
+            backend,
+        )
+        # Rollback turn 1 by resending the same user prefix with a new user hint
+        msg2 = [HELPFUL_SYS, {"role": "user", "content": "fix bug"}, {"role": "user", "content": "try again"}]
+        out2 = await session.run_generation(
+            {"messages": msg2, "tools": None, "sampling_params": {"logprobs": True, "topk_log_probs": k}},
+            backend,
+        )
+        # Normal continuation turn 3 with tool response context
+        msg3 = [
+            *msg2,
+            out2.assistant_msg,
+            {"role": "user", "content": "looks good"},
+        ]
+        await session.run_generation(
+            {"messages": msg3, "tools": None, "sampling_params": {"logprobs": True, "topk_log_probs": k}},
+            backend,
+        )
+        [trajectory] = await session.finalize()
+        topk_ids = trajectory.extra_fields["response_topk_ids"]
+        topk_lp = trajectory.extra_fields["response_topk_log_probs"]
+        assert topk_ids.shape == (len(trajectory.response_ids), k)
+        assert topk_lp.shape == (len(trajectory.response_ids), k)
+        # Turn 1 (base=10) was rolled back and must not appear in the final trajectory
+        assert not (topk_ids == 10).any()
+        # Masked-in assistant tokens from turn 2 (base=20) and turn 3 (base=30) keep their exact heads
+        mask = np.asarray(trajectory.response_mask, dtype=bool)
+        assert set(topk_ids[mask, 0].tolist()) == {20, 30}
+        # Masked-out context tokens get the uniform dummy head 0..k-1
+        assert (topk_ids[~mask] == np.arange(k, dtype=np.int32)).all()
+
+    asyncio.run(scenario())
