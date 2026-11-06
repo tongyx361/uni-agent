@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Literal
 
 from pydantic import Field
 
@@ -24,6 +25,10 @@ class SWEBenchTaskConfig(TaskConfig):
     eval_timeout: float = Field(
         default=600.0,
         description="Per-sample reward-eval timeout (s) inside the sandbox.",
+    )
+    scorer_version: Literal["current", "legacy_20261101"] = Field(
+        default="current",
+        description="SWE-bench scorer implementation; legacy preserves the 2026-11-01 experiment protocol.",
     )
 
 
@@ -61,7 +66,10 @@ class SWEBenchTask(Task):
                 finished = agent_result.finished
                 agent_error = agent_result.info.get("error")
 
-            from .reward import compute_reward
+            if cfg.scorer_version == "legacy_20261101":
+                from .reward_legacy_20261101 import compute_reward
+            else:
+                from .reward import compute_reward
 
             with measure_efficiency("reward"):
                 result = await compute_reward(sample, sandbox, eval_timeout=cfg.eval_timeout)
