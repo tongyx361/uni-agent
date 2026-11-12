@@ -19,6 +19,8 @@ new file mode 100644
 """
     instance = {"repo": "psf/requests", "version": "2.2", "base_commit": "0" * 40}
     monkeypatch.setattr(reward_legacy_20261101, "get_test_directives", lambda _instance: [])
-    old = reward_legacy_20261101._make_eval_script_list(instance, {}, "testbed", "/testbed", instance["base_commit"], patch)
+    old = reward_legacy_20261101._make_eval_script_list(
+        instance, {}, "testbed", "/testbed", instance["base_commit"], patch,
+    )
     assert sum(command.startswith("git clean -fx") for command in old) == 1
     assert not any("git rm -rf --ignore-unmatch" in command for command in old)

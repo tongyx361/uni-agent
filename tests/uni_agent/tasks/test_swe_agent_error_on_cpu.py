@@ -14,7 +14,9 @@ from uni_agent.tasks.swe_bench.task import SWEBenchTask, SWEBenchTaskConfig
 @pytest.mark.asyncio
 @pytest.mark.parametrize("agent_error", [None, "RuntimeError: agent failed"])
 @pytest.mark.parametrize("scorer_version", ["current", "legacy_20261101"])
-async def test_swe_task_preserves_explicit_agent_error_without_changing_reward(monkeypatch, agent_error, scorer_version):
+async def test_swe_task_preserves_explicit_agent_error_without_changing_reward(
+    monkeypatch, agent_error, scorer_version,
+):
     sandbox = object()
 
     @asynccontextmanager
